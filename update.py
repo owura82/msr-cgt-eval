@@ -22,8 +22,7 @@ def setup(link):
     os.system('atom '+new_folder+'/*')
     webbrowser.open(link[:-1])
 
-first_line = ''
-next_line = ''
+
 if len(sys.argv) == 2 and sys.argv[1] == 'start':
     print('starting new session ...')
     line = ''
@@ -32,14 +31,17 @@ if len(sys.argv) == 2 and sys.argv[1] == 'start':
     setup(line)
 
 else:
+    first_line = ''
+    next_line = ''
     with open('github_links_WORKING.csv', 'r') as myfile:
         lines = myfile.readlines()
         first_line = lines[0]
         next_line = lines[1]
 
     with open('github_links_WORKING.csv', 'w') as myfile:
-        for i in range(1, len(lines)):
-            myfile.write(lines[i])
+        # for i in range(1, len(lines)):
+        #     myfile.write(lines[i])
+        myfile.writelines(lines[1:])
 
 
     if len(sys.argv) < 2:
@@ -47,7 +49,7 @@ else:
         with open('github_links_REJECTED.csv', 'a') as myfile:
             myfile.write(first_line)
 
-        # delete folder
+        # delete folder and files created by setup()
         shutil.rmtree('evals/'+folder_name_from_link(first_line))
 
     else:
