@@ -19,7 +19,7 @@ def setup(link):
     prompt = open(new_folder+'/prompt', 'w').close()
     response = open(new_folder+'/response', 'w').close()
 
-    os.system('atom '+new_folder+'/*')
+    os.system('atom '+new_folder+'/fixed '+new_folder+'/prompt '+new_folder+'/buggy')
     webbrowser.open(link[:-1])
 
 
