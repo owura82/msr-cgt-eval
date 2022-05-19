@@ -1,5 +1,6 @@
 import os
 import sys
+#used to generate Copilot responses
 
 def folder_name_from_link(link):
     common = link.index('.com/')
@@ -16,6 +17,8 @@ if len(sys.argv) == 2 and sys.argv[1] == 'start':
         sys.exit()
     if os.path.exists(folder):
         os.system('atom '+folder+'/buggy '+folder+'/fixed')
+        #copy prompt file to response file
+        os.system('cp '+folder+'/prompt '+folder+'/response')
         os.system('code '+folder+'/response')
     else:
         print('PROBLEM: '+folder+' does not exist')
@@ -29,8 +32,9 @@ else:
     
     if(len(lines) < 2):
         print('nothing to check')
-        with open('to_check.csv', 'w') as myfile:
-            myfile.writelines([''])
+        # with open('to_check.csv', 'w') as myfile:
+        #     myfile.writelines([''])
+        open('to_check.csv', 'w').close()
 
         print("\nAdding sample to checked\n")
         with open('checked.csv', 'a') as myfile:
@@ -49,8 +53,8 @@ else:
     folder = 'evals/'+folder_name_from_link(next_line)
     if os.path.exists(folder):
         os.system('atom '+folder+'/buggy '+folder+'/fixed')
+        #copy prompt file to response file
+        os.system('cp '+folder+'/prompt '+folder+'/response')
         os.system('code '+folder+'/response')
     else:
         print('PROBLEM: '+folder+' does not exist')
-
-    
