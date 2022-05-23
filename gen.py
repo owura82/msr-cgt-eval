@@ -16,9 +16,10 @@ if len(sys.argv) == 2 and sys.argv[1] == 'start':
         print('nothing to check')
         sys.exit()
     if os.path.exists(folder):
-        os.system('atom '+folder+'/buggy '+folder+'/fixed')
         #copy prompt file to response file
         os.system('cp '+folder+'/prompt '+folder+'/response')
+
+        os.system('atom '+folder+'/buggy '+folder+'/fixed')
         os.system('code '+folder+'/response')
     else:
         print('PROBLEM: '+folder+' does not exist')
@@ -52,9 +53,10 @@ else:
 
     folder = 'evals/'+folder_name_from_link(next_line)
     if os.path.exists(folder):
-        os.system('atom '+folder+'/buggy '+folder+'/fixed')
         #copy prompt file to response file
         os.system('cp '+folder+'/prompt '+folder+'/response')
+       
+        os.system('atom '+folder+'/buggy '+folder+'/fixed')
         os.system('code '+folder+'/response')
     else:
         print('PROBLEM: '+folder+' does not exist')
