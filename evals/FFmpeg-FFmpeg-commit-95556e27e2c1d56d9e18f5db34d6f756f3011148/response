@@ -431,4 +431,5 @@ static int handle_eac3(MOVMuxContext *mov, AVPacket *pkt, MOVTrack *track)
             if (hdr->substreamid == info->num_ind_sub + 1) {
                 //info->num_ind_sub++;
 
-                *o*
+                //response
+                avpriv_request_sample(mov->fc, "Independent substream");

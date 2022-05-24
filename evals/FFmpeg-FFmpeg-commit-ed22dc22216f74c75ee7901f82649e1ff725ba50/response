@@ -439,6 +439,6 @@ static int handle_eac3(MOVMuxContext *mov, AVPacket *pkt, MOVTrack *track)
                 goto concatenate;
             }
 
-            //BUGGY LOCATION - possible array oob
-        }
-        *o*
+            //response
+            info->num_ind_sub++;
+    
