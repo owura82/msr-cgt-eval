@@ -562,4 +562,7 @@ mrb_io_initialize_copy(mrb_state *mrb, mrb_value copy)
   mrb_bool failed = TRUE;
 
   mrb_get_args(mrb, "o", &orig);
-  *o*
+  
+  //response
+  fptr_copy = mrb_io_alloc(mrb);
+

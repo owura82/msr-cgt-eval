@@ -1,0 +1,150 @@
+//C FILE
+/*
+    cgi.c -- CGI processing
+
+    This module implements the /cgi-bin handler. CGI processing differs from
+    goforms processing in that each CGI request is executed as a separate
+    process, rather than within the webserver process. For each CGI request the
+    environment of the new process must be set to include all the CGI variables
+    and its standard input and output must be directed to the socket.  This
+    is done using temporary files.
+
+    Copyright (c) All Rights Reserved. See details at the end of the file.
+ */
+
+/*********************************** Includes *********************************/
+
+#include    "goahead.h"
+
+/*********************************** Defines **********************************/
+#if ME_GOAHEAD_CGI
+
+#if ME_WIN_LIKE
+    typedef HANDLE CgiPid;
+#else
+    typedef pid_t CgiPid;
+#endif
+
+typedef struct Cgi {            /* Struct for CGI tasks which have completed */
+    Webs    *wp;                /* Connection object */
+    char    *stdIn;             /* File desc. for task's temp input fd */
+    char    *stdOut;            /* File desc. for task's temp output fd */
+    char    *cgiPath;           /* Path to executable process file */
+    char    **argp;             /* Pointer to buf containing argv tokens */
+    char    **envp;             /* Pointer to array of environment strings */
+    CgiPid  handle;             /* Process handle of the task */
+    off_t   fplacemark;         /* Seek location for CGI output file */
+} Cgi;
+
+static Cgi      **cgiList;      /* walloc chain list of wp's to be closed */
+static int      cgiMax;         /* Size of walloc list */
+
+/************************************ Forwards ********************************/
+
+static int checkCgi(CgiPid handle);
+static CgiPid launchCgi(char *cgiPath, char **argp, char **envp, char *stdIn, char *stdOut);
+
+/************************************* Code ***********************************/
+/*
+    Process a form request.
+    Return true to indicate the request was handled, even for errors.
+ */
+PUBLIC bool cgiHandler(Webs *wp)
+{
+    Cgi         *cgip;
+    WebsKey     *s;
+    char        cgiPrefix[ME_GOAHEAD_LIMIT_FILENAME], *stdIn, *stdOut, cwd[ME_GOAHEAD_LIMIT_FILENAME];
+    char        *cp, *cgiName, *cgiPath, **argp, **envp, **ep, *tok, *query, *dir, *extraPath, *exe;
+    CgiPid      pHandle;
+    int         n, envpsize, argpsize, cid;
+
+    assert(websValid(wp));
+
+    websSetEnv(wp);
+
+    /*
+        Extract the form name and then build the full path name. The form name will follow the first '/' in path.
+     */
+    scopy(cgiPrefix, sizeof(cgiPrefix), wp->path);
+    if ((cgiName = strchr(&cgiPrefix[1], '/')) == NULL) {
+        websError(wp, HTTP_CODE_NOT_FOUND, "Missing CGI name");
+        return 1;
+    }
+    *cgiName++ = '\0';
+
+    getcwd(cwd, ME_GOAHEAD_LIMIT_FILENAME);
+    dir = wp->route->dir ? wp->route->dir : cwd;
+    chdir(dir);
+
+    extraPath = 0;
+    if ((cp = strchr(cgiName, '/')) != NULL) {
+        extraPath = sclone(cp);
+        *cp = '\0';
+        websSetVar(wp, "PATH_INFO", extraPath);
+        websSetVarFmt(wp, "PATH_TRANSLATED", "%s%s%s", dir, cgiPrefix, extraPath);
+        wfree(extraPath);
+    } else {
+        websSetVar(wp, "PATH_INFO", "");
+        websSetVar(wp, "PATH_TRANSLATED", "");
+    }
+    cgiPath = sfmt("%s%s/%s", dir, cgiPrefix, cgiName);
+    websSetVarFmt(wp, "SCRIPT_NAME", "%s/%s", cgiPrefix, cgiName);
+    websSetVar(wp, "SCRIPT_FILENAME", cgiPath);
+
+/*
+    See if the file exists and is executable.  If not error out.  Don't do this step for VxWorks, since the module
+    may already be part of the OS image, rather than in the file system.
+*/
+#if !VXWORKS
+    {
+        WebsStat sbuf;
+        if (stat(cgiPath, &sbuf) != 0 || (sbuf.st_mode & S_IFREG) == 0) {
+            exe = sfmt("%s.exe", cgiPath);
+            if (stat(exe, &sbuf) == 0 && (sbuf.st_mode & S_IFREG)) {
+                wfree(cgiPath);
+                cgiPath = exe;
+            } else {
+                error("Cannot find CGI program: ", cgiPath);
+                websError(wp, HTTP_CODE_NOT_FOUND | WEBS_NOLOG, "CGI program file does not exist");
+                wfree(cgiPath);
+                return 1;
+            }
+        }
+#if ME_WIN_LIKE
+        if (strstr(cgiPath, ".exe") == NULL && strstr(cgiPath, ".bat") == NULL)
+#else
+        if (access(cgiPath, X_OK) != 0)
+#endif
+        {
+            websError(wp, HTTP_CODE_NOT_FOUND, "CGI process file is not executable");
+            wfree(cgiPath);
+            return 1;
+        }
+    }
+#endif /* ! VXWORKS */
+    /*
+        Build command line arguments.  Only used if there is no non-encoded = character.  This is indicative of a ISINDEX
+        query.  POST separators are & and others are +.  argp will point to a walloc'd array of pointers.  Each pointer
+        will point to substring within the query string.  This array of string pointers is how the spawn or exec routines
+        expect command line arguments to be passed.  Since we don't know ahead of time how many individual items there are
+        in the query string, the for loop includes logic to grow the array size via wrealloc.
+     */
+    argpsize = 10;
+    argp = walloc(argpsize * sizeof(char *));
+    *argp = cgiPath;
+    n = 1;
+    query = 0;
+
+    if (strchr(wp->query, '=') == NULL) {
+        query = sclone(wp->query);
+        websDecodeUrl(query, query, strlen(query));
+
+
+        //response
+        for (tok = stok(query, "&", &query); tok != NULL; tok = stok(NULL, "&", &query)) {
+            if (n >= argpsize) {
+                argpsize += 10;
+                argp = wrealloc(argp, argpsize * sizeof(char *));
+            }
+            argp[n++] = tok;
+        }

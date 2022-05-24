@@ -1,0 +1,498 @@
+//C FILE
+/* $Id: form.c,v 1.35 2010/07/18 13:48:48 htrb Exp $ */
+/*
+ * HTML forms
+ */
+#include "fm.h"
+#include "parsetag.h"
+#include "parsetagx.h"
+#include "myctype.h"
+#include "local.h"
+#include "regex.h"
+
+extern Str *textarea_str;
+extern int max_textarea;
+#ifdef MENU_SELECT
+extern FormSelectOption *select_option;
+extern int max_select;
+#include "menu.h"
+#endif				/* MENU_SELECT */
+
+/* *INDENT-OFF* */
+struct {
+    char *action;
+    void (*rout)(struct parsed_tagarg *);
+} internal_action[] = {
+    {"map", follow_map},
+    {"option", panel_set_option},
+#ifdef USE_COOKIE
+    {"cookie", set_cookie_flag},
+#endif				/* USE_COOKIE */
+    {"download", download_action},
+#ifdef USE_M17N
+    { "charset", change_charset },
+#endif
+    {"none", NULL},
+    {NULL, NULL},
+};
+/* *INDENT-ON* */
+
+struct form_list *
+newFormList(char *action, char *method, char *charset, char *enctype,
+	    char *target, char *name, struct form_list *_next)
+{
+    struct form_list *l;
+    Str a = Strnew_charp(action);
+    int m = FORM_METHOD_GET;
+    int e = FORM_ENCTYPE_URLENCODED;
+#ifdef USE_M17N
+    wc_ces c = 0;
+#endif
+
+    if (method == NULL || !strcasecmp(method, "get"))
+	m = FORM_METHOD_GET;
+    else if (!strcasecmp(method, "post"))
+	m = FORM_METHOD_POST;
+    else if (!strcasecmp(method, "internal"))
+	m = FORM_METHOD_INTERNAL;
+    /* unknown method is regarded as 'get' */
+
+    if (m != FORM_METHOD_GET && enctype != NULL &&
+	!strcasecmp(enctype, "multipart/form-data")) {
+	e = FORM_ENCTYPE_MULTIPART;
+    }
+
+#ifdef USE_M17N
+    if (charset != NULL)
+	c = wc_guess_charset(charset, 0);
+#endif
+
+    l = New(struct form_list);
+    l->item = l->lastitem = NULL;
+    l->action = a;
+    l->method = m;
+#ifdef USE_M17N
+    l->charset = c;
+#endif
+    l->enctype = e;
+    l->target = target;
+    l->name = name;
+    l->next = _next;
+    l->nitems = 0;
+    l->body = NULL;
+    l->length = 0;
+    return l;
+}
+
+/*
+ * add <input> element to form_list
+ */
+struct form_item_list *
+formList_addInput(struct form_list *fl, struct parsed_tag *tag)
+{
+    struct form_item_list *item;
+    char *p;
+    int i;
+
+    /* if not in <form>..</form> environment, just ignore <input> tag */
+    if (fl == NULL)
+	return NULL;
+
+    item = New(struct form_item_list);
+    item->type = FORM_UNKNOWN;
+    item->size = -1;
+    item->rows = 0;
+    item->checked = item->init_checked = 0;
+    item->accept = 0;
+    item->name = NULL;
+    item->value = item->init_value = NULL;
+    item->readonly = 0;
+    if (parsedtag_get_value(tag, ATTR_TYPE, &p)) {
+	item->type = formtype(p);
+	if (item->size < 0 &&
+	    (item->type == FORM_INPUT_TEXT ||
+	     item->type == FORM_INPUT_FILE ||
+	     item->type == FORM_INPUT_PASSWORD))
+	    item->size = FORM_I_TEXT_DEFAULT_SIZE;
+    }
+    if (parsedtag_get_value(tag, ATTR_NAME, &p))
+	item->name = Strnew_charp(p);
+    if (parsedtag_get_value(tag, ATTR_VALUE, &p))
+	item->value = item->init_value = Strnew_charp(p);
+    item->checked = item->init_checked = parsedtag_exists(tag, ATTR_CHECKED);
+    item->accept = parsedtag_exists(tag, ATTR_ACCEPT);
+    parsedtag_get_value(tag, ATTR_SIZE, &item->size);
+    parsedtag_get_value(tag, ATTR_MAXLENGTH, &item->maxlength);
+    item->readonly = parsedtag_exists(tag, ATTR_READONLY);
+    if (parsedtag_get_value(tag, ATTR_TEXTAREANUMBER, &i)
+	&& i >= 0 && i < max_textarea)
+	item->value = item->init_value = textarea_str[i];
+#ifdef MENU_SELECT
+    if (parsedtag_get_value(tag, ATTR_SELECTNUMBER, &i)
+	&& i >= 0 && i < max_select)
+	item->select_option = select_option[i].first;
+#endif				/* MENU_SELECT */
+    if (parsedtag_get_value(tag, ATTR_ROWS, &p))
+	item->rows = atoi(p);
+    if (item->type == FORM_UNKNOWN) {
+	/* type attribute is missing. Ignore the tag. */
+	return NULL;
+    }
+#ifdef MENU_SELECT
+    if (item->type == FORM_SELECT) {
+	chooseSelectOption(item, item->select_option);
+	item->init_selected = item->selected;
+	item->init_value = item->value;
+	item->init_label = item->label;
+    }
+#endif				/* MENU_SELECT */
+    if (item->type == FORM_INPUT_FILE && item->value && item->value->length) {
+	/* security hole ! */
+	return NULL;
+    }
+    item->parent = fl;
+    item->next = NULL;
+    if (fl->item == NULL) {
+	fl->item = fl->lastitem = item;
+    }
+    else {
+	fl->lastitem->next = item;
+	fl->lastitem = item;
+    }
+    if (item->type == FORM_INPUT_HIDDEN)
+	return NULL;
+    fl->nitems++;
+    return item;
+}
+
+static char *_formtypetbl[] = {
+    "text", "password", "checkbox", "radio", "submit", "reset", "hidden",
+    "image", "select", "textarea", "button", "file", NULL
+};
+
+static char *_formmethodtbl[] = {
+    "GET", "POST", "INTERNAL", "HEAD"
+};
+
+char *
+form2str(FormItemList *fi)
+{
+    Str tmp = Strnew();
+
+    if (fi->type != FORM_SELECT && fi->type != FORM_TEXTAREA)
+	Strcat_charp(tmp, "input type=");
+    Strcat_charp(tmp, _formtypetbl[fi->type]);
+    if (fi->name && fi->name->length)
+	Strcat_m_charp(tmp, " name=\"", fi->name->ptr, "\"", NULL);
+    if ((fi->type == FORM_INPUT_RADIO || fi->type == FORM_INPUT_CHECKBOX ||
+	 fi->type == FORM_SELECT) && fi->value)
+	Strcat_m_charp(tmp, " value=\"", fi->value->ptr, "\"", NULL);
+    Strcat_m_charp(tmp, " (", _formmethodtbl[fi->parent->method], " ",
+		   fi->parent->action->ptr, ")", NULL);
+    return tmp->ptr;
+}
+
+int
+formtype(char *typestr)
+{
+    int i;
+    for (i = 0; _formtypetbl[i]; i++) {
+	if (!strcasecmp(typestr, _formtypetbl[i]))
+	    return i;
+    }
+    return FORM_INPUT_TEXT;
+}
+
+void
+formRecheckRadio(Anchor *a, Buffer *buf, FormItemList *fi)
+{
+    int i;
+    Anchor *a2;
+    FormItemList *f2;
+
+    for (i = 0; i < buf->formitem->nanchor; i++) {
+	a2 = &buf->formitem->anchors[i];
+	f2 = (FormItemList *)a2->url;
+	if (f2->parent == fi->parent && f2 != fi &&
+	    f2->type == FORM_INPUT_RADIO && Strcmp(f2->name, fi->name) == 0) {
+	    f2->checked = 0;
+	    formUpdateBuffer(a2, buf, f2);
+	}
+    }
+    fi->checked = 1;
+    formUpdateBuffer(a, buf, fi);
+}
+
+void
+formResetBuffer(Buffer *buf, AnchorList *formitem)
+{
+    int i;
+    Anchor *a;
+    FormItemList *f1, *f2;
+
+    if (buf == NULL || buf->formitem == NULL || formitem == NULL)
+	return;
+    for (i = 0; i < buf->formitem->nanchor && i < formitem->nanchor; i++) {
+	a = &buf->formitem->anchors[i];
+	if (a->y != a->start.line)
+	    continue;
+	f1 = (FormItemList *)a->url;
+	f2 = (FormItemList *)formitem->anchors[i].url;
+	if (f1->type != f2->type ||
+	    strcmp(((f1->name == NULL) ? "" : f1->name->ptr),
+		   ((f2->name == NULL) ? "" : f2->name->ptr)))
+	    break;		/* What's happening */
+	switch (f1->type) {
+	case FORM_INPUT_TEXT:
+	case FORM_INPUT_PASSWORD:
+	case FORM_INPUT_FILE:
+	case FORM_TEXTAREA:
+	    f1->value = f2->value;
+	    f1->init_value = f2->init_value;
+	    break;
+	case FORM_INPUT_CHECKBOX:
+	case FORM_INPUT_RADIO:
+	    f1->checked = f2->checked;
+	    f1->init_checked = f2->init_checked;
+	    break;
+	case FORM_SELECT:
+#ifdef MENU_SELECT
+	    f1->select_option = f2->select_option;
+	    f1->value = f2->value;
+	    f1->label = f2->label;
+	    f1->selected = f2->selected;
+	    f1->init_value = f2->init_value;
+	    f1->init_label = f2->init_label;
+	    f1->init_selected = f2->init_selected;
+#endif				/* MENU_SELECT */
+	    break;
+	default:
+	    continue;
+	}
+	formUpdateBuffer(a, buf, f1);
+    }
+}
+
+static int
+form_update_line(Line *line, char **str, int spos, int epos, int width,
+		 int newline, int password)
+{
+    int c_len = 1, c_width = 1, w, i, len, pos;
+    char *p, *buf;
+    Lineprop c_type, effect, *prop;
+
+    for (p = *str, w = 0, pos = 0; *p && w < width;) {
+	c_type = get_mctype((unsigned char *)p);
+#ifdef USE_M17N
+	c_len = get_mclen(p);
+	c_width = get_mcwidth(p);
+#endif
+	if (c_type == PC_CTRL) {
+	    if (newline && *p == '\n')
+		break;
+	    if (*p != '\r') {
+		w++;
+		pos++;
+	    }
+	}
+	else if (password) {
+#ifdef USE_M17N
+	    if (w + c_width > width)
+		break;
+#endif
+	    w += c_width;
+	    pos += c_width;
+#ifdef USE_M17N
+	}
+	else if (c_type & PC_UNKNOWN) {
+	    w++;
+	    pos++;
+	}
+	else {
+	    if (w + c_width > width)
+		break;
+#endif
+	    w += c_width;
+	    pos += c_len;
+	}
+	p += c_len;
+    }
+    pos += width - w;
+
+    len = line->len + pos + spos - epos;
+    buf = New_N(char, len + 1);
+    buf[len] = '\0';
+    prop = New_N(Lineprop, len);
+    bcopy((void *)line->lineBuf, (void *)buf, spos * sizeof(char));
+    bcopy((void *)line->propBuf, (void *)prop, spos * sizeof(Lineprop));
+
+    effect = CharEffect(line->propBuf[spos]);
+    for (p = *str, w = 0, pos = spos; *p && w < width;) {
+	c_type = get_mctype((unsigned char *)p);
+#ifdef USE_M17N
+	c_len = get_mclen(p);
+	c_width = get_mcwidth(p);
+#endif
+	if (c_type == PC_CTRL) {
+	    if (newline && *p == '\n')
+		break;
+	    if (*p != '\r') {
+		buf[pos] = password ? '*' : ' ';
+		prop[pos] = effect | PC_ASCII;
+		pos++;
+		w++;
+	    }
+	}
+	else if (password) {
+#ifdef USE_M17N
+	    if (w + c_width > width)
+		break;
+#endif
+	    for (i = 0; i < c_width; i++) {
+		buf[pos] = '*';
+		prop[pos] = effect | PC_ASCII;
+		pos++;
+		w++;
+	    }
+#ifdef USE_M17N
+	}
+	else if (c_type & PC_UNKNOWN) {
+	    buf[pos] = ' ';
+	    prop[pos] = effect | PC_ASCII;
+	    pos++;
+	    w++;
+	}
+	else {
+	    if (w + c_width > width)
+		break;
+#else
+	}
+	else {
+#endif
+	    buf[pos] = *p;
+	    prop[pos] = effect | c_type;
+	    pos++;
+#ifdef USE_M17N
+	    c_type = (c_type & ~PC_WCHAR1) | PC_WCHAR2;
+	    for (i = 1; i < c_len; i++) {
+		buf[pos] = p[i];
+		prop[pos] = effect | c_type;
+		pos++;
+	    }
+#endif
+	    w += c_width;
+	}
+	p += c_len;
+    }
+    for (; w < width; w++) {
+	buf[pos] = ' ';
+	prop[pos] = effect | PC_ASCII;
+	pos++;
+    }
+    if (newline) {
+	if (!FoldTextarea) {
+	    while (*p && *p != '\r' && *p != '\n')
+		p++;
+	}
+	if (*p == '\r')
+	    p++;
+	if (*p == '\n')
+	    p++;
+    }
+    *str = p;
+
+    bcopy((void *)&line->lineBuf[epos], (void *)&buf[pos],
+	  (line->len - epos) * sizeof(char));
+    bcopy((void *)&line->propBuf[epos], (void *)&prop[pos],
+	  (line->len - epos) * sizeof(Lineprop));
+    line->lineBuf = buf;
+    line->propBuf = prop;
+    line->len = len;
+    line->size = len;
+
+    return pos;
+}
+
+void
+formUpdateBuffer(Anchor *a, Buffer *buf, FormItemList *form)
+{
+    Buffer save;
+    char *p;
+    int spos, epos, rows, c_rows, pos, col = 0;
+    Line *l;
+
+    copyBuffer(&save, buf);
+    gotoLine(buf, a->start.line);
+    switch (form->type) {
+    case FORM_TEXTAREA:
+    case FORM_INPUT_TEXT:
+    case FORM_INPUT_FILE:
+    case FORM_INPUT_PASSWORD:
+    case FORM_INPUT_CHECKBOX:
+    case FORM_INPUT_RADIO:
+#ifdef MENU_SELECT
+    case FORM_SELECT:
+#endif				/* MENU_SELECT */
+	spos = a->start.pos;
+	epos = a->end.pos;
+	break;
+    default:
+	spos = a->start.pos + 1;
+	epos = a->end.pos - 1;
+    }
+    switch (form->type) {
+    case FORM_INPUT_CHECKBOX:
+    case FORM_INPUT_RADIO:
+	if (buf->currentLine == NULL ||
+	    spos >= buf->currentLine->len || spos < 0)
+	    break;
+	if (form->checked)
+	    buf->currentLine->lineBuf[spos] = '*';
+	else
+	    buf->currentLine->lineBuf[spos] = ' ';
+	break;
+    case FORM_INPUT_TEXT:
+    case FORM_INPUT_FILE:
+    case FORM_INPUT_PASSWORD:
+    case FORM_TEXTAREA:
+#ifdef MENU_SELECT
+    case FORM_SELECT:
+	if (form->type == FORM_SELECT) {
+	    p = form->label->ptr;
+	    updateSelectOption(form, form->select_option);
+	}
+	else
+#endif				/* MENU_SELECT */
+	{
+	    if (!form->value)
+		break;
+	    p = form->value->ptr;
+	}
+	l = buf->currentLine;
+	if (!l)
+	    break;
+	if (form->type == FORM_TEXTAREA) {
+	    int n = a->y - buf->currentLine->linenumber;
+	    if (n > 0)
+		for (; l && n; l = l->prev, n--) ;
+	    else if (n < 0)
+		for (; l && n; l = l->prev, n++) ;
+	    if (!l)
+		break;
+	}
+	rows = form->rows ? form->rows : 1;
+	col = COLPOS(l, a->start.pos);
+	for (c_rows = 0; c_rows < rows; c_rows++, l = l->next) {
+
+		//response
+	    if (!l)
+		break;
+	    pos = formUpdateLine(form, l, p, col);
+	    if (pos > 0)
+		p += pos;
+	}
+	break;
+    }
+    copyBuffer(buf, &save);
+}
+	}

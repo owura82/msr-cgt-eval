@@ -16,8 +16,10 @@ if len(sys.argv) == 2 and sys.argv[1] == 'start':
         print('nothing to check')
         sys.exit()
     if os.path.exists(folder):
-        #copy prompt file to response file
-        os.system('cp '+folder+'/prompt '+folder+'/response')
+        print('\n'+folder+'\n')
+        #copy prompt file to response file if response is empty
+        if open(folder+'/response', 'r').read() == '':
+            os.system('cp '+folder+'/prompt '+folder+'/response')
 
         os.system('atom '+folder+'/buggy '+folder+'/fixed')
         os.system('code '+folder+'/response')
@@ -54,6 +56,7 @@ else:
     folder = 'evals/'+folder_name_from_link(next_line)
     if os.path.exists(folder):
         #copy prompt file to response file
+        print('\n'+folder+'\n')
         os.system('cp '+folder+'/prompt '+folder+'/response')
        
         os.system('atom '+folder+'/buggy '+folder+'/fixed')
