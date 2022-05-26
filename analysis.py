@@ -1,5 +1,6 @@
 import os
 import sys
+import webbrowser
 
 def folder_name_from_link(link):
     common = link.index('.com/')
@@ -7,12 +8,19 @@ def folder_name_from_link(link):
 
 
 def setup(link):
+    if link == '':
+        print('\nno more links to check\n')
+        return
+        
     folder = 'evals/'+folder_name_from_link(link)
+    # os.system('code '+folder+'/buggy')
+    # os.system('code '+folder+'/fixed')
     os.system('code '+folder+'/response')
-    os.system('code '+folder+'/buggy')
-    os.system('code '+folder+'/fixed')
 
-def remove():
+    webbrowser.open(link[:-1])
+
+
+def remove_first_line():
     lines = []
     with open('to_check.csv', 'r') as myfile:
         lines = myfile.readlines()
@@ -53,7 +61,7 @@ elif len(sys.argv) == 2:
         with open('to_check.csv', 'r') as myfile:
             first = myfile.readline()
             next_line = myfile.readline()
-            remove()
+            remove_first_line()
             save_result(sys.argv[1], first)
             setup(next_line)
     else:
