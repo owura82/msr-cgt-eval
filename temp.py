@@ -50,4 +50,15 @@ import os
 #                 os.system('mv '+buggy+' '+folder_path+'/file.c')
 #             count += 1
 # print(count, cpp_count, c_count)
+
+# create latex table for dates of selected projects
+open('latex_table.txt', 'w').close()
+with open('first_hundred_with_date.csv', 'r') as f:
+    lines = f.readlines()
+    for i,line in enumerate(lines):
+        if i > 51:
+            line_arr = line.split(',')
+            to_write = str(i-51) + ' & '+ line_arr[0] + ' & '+ line_arr[1][:-1] + ' \\\\ \n\\hline\n'
+            with open('latex_table.txt', 'a') as g:
+                g.write(to_write)
         

@@ -1,0 +1,57 @@
+//c file
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include "config.h"
+#include "libavutil/attributes.h"
+#include "libavutil/cpu.h"
+#include "libavutil/x86/cpu.h"
+#include "libavcodec/mpegvideodsp.h"
+#include "libavcodec/videodsp.h"
+
+#if HAVE_INLINE_ASM
+
+static void gmc_mmx(uint8_t *dst, uint8_t *src,
+                    int stride, int h, int ox, int oy,
+                    int dxx, int dxy, int dyx, int dyy,
+                    int shift, int r, int width, int height)
+{
+    const int w    = 8;
+    const int ix   = ox  >> (16 + shift);
+    const int iy   = oy  >> (16 + shift);
+    const int oxs  = ox  >> 4;
+    const int oys  = oy  >> 4;
+    const int dxxs = dxx >> 4;
+    const int dxys = dxy >> 4;
+    const int dyxs = dyx >> 4;
+    const int dyys = dyy >> 4;
+    const uint16_t r4[4]   = { r, r, r, r };
+    const uint16_t dxy4[4] = { dxys, dxys, dxys, dxys };
+    const uint16_t dyy4[4] = { dyys, dyys, dyys, dyys };
+    const uint64_t shift2  = 2 * shift;
+#define MAX_STRIDE 4096U
+#define MAX_H 8U
+    uint8_t edge_buf[(MAX_H + 1) * MAX_STRIDE];
+    int x, y;
+
+    const int dxw = (dxx - (1 << (16 + shift))) * (w - 1);
+    const int dyh = (dyy - (1 << (16 + shift))) * (h - 1);
+    const int dxh = dxy * (h - 1);
+    const int dyw = dyx * (w - 1);
+
+    int need_emu  =  *o*
