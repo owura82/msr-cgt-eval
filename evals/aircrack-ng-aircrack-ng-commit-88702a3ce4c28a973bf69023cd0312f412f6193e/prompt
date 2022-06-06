@@ -1,0 +1,135 @@
+//c file
+/*
+ *  Copyright (c) 2007, 2008, Andrea Bittau <a.bittau@cs.ucl.ac.uk>
+ *
+ *  OS dependent API for using card via network.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <assert.h>
+#include <sys/select.h>
+#include <errno.h>
+
+#include "osdep.h"
+#include "network.h"
+
+#define QUEUE_MAX 666
+
+struct queue {
+ unsigned char	q_buf[2048];
+ int		q_len;
+
+ struct queue	*q_next;
+ struct queue	*q_prev;
+};
+
+struct priv_net {
+ int		pn_s;
+ struct queue	pn_queue;
+ struct queue	pn_queue_free;
+ int		pn_queue_len;
+};
+
+int net_send(int s, int command, void *arg, int len)
+{
+ struct net_hdr *pnh;
+ char *pktbuf;
+ size_t pktlen;
+
+ pktlen = sizeof(struct net_hdr) + len;
+
+ pktbuf = (char*)calloc(sizeof(char), pktlen);
+ if (pktbuf == NULL) {
+   perror("calloc");
+   goto net_send_error;
+ }
+
+ pnh = (struct net_hdr*)pktbuf;
+ pnh->nh_type = command;
+ pnh->nh_len = htonl(len);
+
+ memcpy(pktbuf + sizeof(struct net_hdr), arg, len);
+
+ for (;;) {
+   ssize_t rc = send(s, pktbuf, pktlen, 0);
+
+   if ((size_t)rc == pktlen)
+     break;
+
+   if (rc == EAGAIN || rc == EWOULDBLOCK || rc == EINTR)
+     continue;
+
+   if (rc == ECONNRESET)
+     printf("Connection reset while sending packet!\n");
+
+   goto net_send_error;
+ }
+
+ free(pktbuf);
+ return 0;
+
+net_send_error:
+ free(pktbuf);
+ return -1;
+}
+
+int net_read_exact(int s, void *arg, int len)
+{
+ ssize_t rc;
+ int rlen = 0;
+ char *buf = (char*)arg;
+ while (rlen < len) {
+   rc = recv(s, buf, (len - rlen), 0);
+
+   if (rc < 1) {
+     if (rc == -1 && (errno == EAGAIN || errno == EINTR)) {
+       usleep(100);
+       continue;
+     }
+
+     return -1;
+   }
+
+   buf += rc;
+   rlen += rc;
+ }
+
+ return 0;
+}
+
+int net_get(int s, void *arg, int *len)
+{
+ struct net_hdr nh;
+ int plen;
+
+ if (net_read_exact(s, &nh, sizeof(nh)) == -1)
+       {
+   return -1;
+       }
+
+ plen = ntohl(nh.nh_len);
+ if (!(plen <= *len))
+   printf("PLEN %d type %d len %d\n",
+     plen, nh.nh_type, *len);
+ *o*
