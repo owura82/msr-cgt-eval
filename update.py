@@ -3,6 +3,8 @@ import webbrowser
 import os
 import shutil
 
+# used for selecting samples for evaluation
+
 def folder_name_from_link(link):
     common = link.index('.com/')
     return link[common+5:-1].replace('/', '-')

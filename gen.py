@@ -1,5 +1,7 @@
 import os
 import sys
+import webbrowser
+
 #used to generate Copilot responses
 
 def folder_name_from_link(link):
@@ -21,8 +23,10 @@ if len(sys.argv) == 2 and sys.argv[1] == 'start':
         if open(folder+'/response', 'r').read() == '':
             os.system('cp '+folder+'/prompt '+folder+'/response')
 
-        os.system('atom '+folder+'/buggy '+folder+'/fixed')
+        # os.system('atom '+folder+'/buggy '+folder+'/fixed')
         os.system('code '+folder+'/response')
+
+        webbrowser.open(line[:-1])
     else:
         print('PROBLEM: '+folder+' does not exist')
 else:
@@ -55,11 +59,13 @@ else:
 
     folder = 'evals/'+folder_name_from_link(next_line)
     if os.path.exists(folder):
-        #copy prompt file to response file
         print('\n'+folder+'\n')
-        os.system('cp '+folder+'/prompt '+folder+'/response')
+        #copy prompt file to response file if response is empty
+        if open(folder+'/response', 'r').read() == '':
+            os.system('cp '+folder+'/prompt '+folder+'/response')
        
-        os.system('atom '+folder+'/buggy '+folder+'/fixed')
+        # os.system('atom '+folder+'/buggy '+folder+'/fixed')
         os.system('code '+folder+'/response')
+        webbrowser.open(next_line[:-1])
     else:
         print('PROBLEM: '+folder+' does not exist')

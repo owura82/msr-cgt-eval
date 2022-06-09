@@ -1,0 +1,404 @@
+//c file
+/*
+    abrt-hook-ccpp.cpp - the hook for C/C++ crashing program
+
+    Copyright (C) 2009	Zdenek Prikryl (zprikryl@redhat.com)
+    Copyright (C) 2009	RedHat inc.
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+#include <sys/utsname.h>
+#include "libabrt.h"
+
+#define  DUMP_SUID_UNSAFE 1
+#define  DUMP_SUID_SAFE 2
+
+
+/* I want to use -Werror, but gcc-4.4 throws a curveball:
+ * "warning: ignoring return value of 'ftruncate', declared with attribute warn_unused_result"
+ * and (void) cast is not enough to shut it up! Oh God...
+ */
+#define IGNORE_RESULT(func_call) do { if (func_call) /* nothing */; } while (0)
+
+static char* malloc_readlink(const char *linkname)
+{
+    char buf[PATH_MAX + 1];
+    int len;
+
+    len = readlink(linkname, buf, sizeof(buf)-1);
+    if (len >= 0)
+    {
+        buf[len] = '\0';
+        return xstrdup(buf);
+    }
+    return NULL;
+}
+
+/* Custom version of copyfd_xyz,
+ * one which is able to write into two descriptors at once.
+ */
+#define CONFIG_FEATURE_COPYBUF_KB 4
+static off_t copyfd_sparse(int src_fd, int dst_fd1, int dst_fd2, off_t size2)
+{
+	off_t total = 0;
+	int last_was_seek = 0;
+#if CONFIG_FEATURE_COPYBUF_KB <= 4
+	char buffer[CONFIG_FEATURE_COPYBUF_KB * 1024];
+	enum { buffer_size = sizeof(buffer) };
+#else
+	char *buffer;
+	int buffer_size;
+
+	/* We want page-aligned buffer, just in case kernel is clever
+	 * and can do page-aligned io more efficiently */
+	buffer = mmap(NULL, CONFIG_FEATURE_COPYBUF_KB * 1024,
+			PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANON,
+			/* ignored: */ -1, 0);
+	buffer_size = CONFIG_FEATURE_COPYBUF_KB * 1024;
+	if (buffer == MAP_FAILED) {
+		buffer = alloca(4 * 1024);
+		buffer_size = 4 * 1024;
+	}
+#endif
+
+	while (1) {
+		ssize_t rd = safe_read(src_fd, buffer, buffer_size);
+		if (!rd) { /* eof */
+			if (last_was_seek) {
+				if (lseek(dst_fd1, -1, SEEK_CUR) < 0
+				 || safe_write(dst_fd1, "", 1) != 1
+				 || (dst_fd2 >= 0
+				     && (lseek(dst_fd2, -1, SEEK_CUR) < 0
+					 || safe_write(dst_fd2, "", 1) != 1
+				        )
+				    )
+				) {
+					perror_msg("Write error");
+					total = -1;
+					goto out;
+				}
+			}
+			/* all done */
+			goto out;
+		}
+		if (rd < 0) {
+			perror_msg("Read error");
+			total = -1;
+			goto out;
+		}
+
+		/* checking sparseness */
+		ssize_t cnt = rd;
+		while (--cnt >= 0) {
+			if (buffer[cnt] != 0) {
+				/* not sparse */
+				errno = 0;
+				ssize_t wr1 = full_write(dst_fd1, buffer, rd);
+				ssize_t wr2 = (dst_fd2 >= 0 ? full_write(dst_fd2, buffer, rd) : rd);
+				if (wr1 < rd || wr2 < rd) {
+					perror_msg("Write error");
+					total = -1;
+					goto out;
+				}
+				last_was_seek = 0;
+				goto adv;
+			}
+		}
+		/* sparse */
+		xlseek(dst_fd1, rd, SEEK_CUR);
+		if (dst_fd2 >= 0)
+			xlseek(dst_fd2, rd, SEEK_CUR);
+		last_was_seek = 1;
+ adv:
+		total += rd;
+		size2 -= rd;
+		if (size2 < 0)
+			dst_fd2 = -1;
+//TODO: truncate to 0 or even delete the second file
+//(currently we delete the file later)
+	}
+ out:
+
+#if CONFIG_FEATURE_COPYBUF_KB > 4
+	if (buffer_size != 4 * 1024)
+		munmap(buffer, buffer_size);
+#endif
+	return total;
+}
+
+
+/* Global data */
+
+static char *user_pwd;
+static char *proc_pid_status;
+static struct dump_dir *dd;
+static int user_core_fd = -1;
+/*
+ * %s - signal number
+ * %c - ulimit -c value
+ * %p - pid
+ * %u - uid
+ * %g - gid
+ * %t - UNIX time of dump
+ * %e - executable filename
+ * %h - hostname
+ * %% - output one "%"
+ */
+/* Hook must be installed with exactly the same sequence of %c specifiers.
+ * Last one, %h, may be omitted (we can find it out).
+ */
+static const char percent_specifiers[] = "%scpugteh";
+static char *core_basename = (char*) "core";
+/*
+ * Used for error messages only.
+ * It is either the same as core_basename if it is absolute,
+ * or $PWD/core_basename.
+ */
+static char *full_core_basename;
+
+
+static char* get_executable(pid_t pid, int *fd_p)
+{
+    char buf[sizeof("/proc/%lu/exe") + sizeof(long)*3];
+
+    sprintf(buf, "/proc/%lu/exe", (long)pid);
+    if (fd_p)
+        *fd_p = open(buf, O_RDONLY); /* might fail and return -1, it's ok */
+    char *executable = malloc_readlink(buf);
+    if (!executable)
+        return NULL;
+    /* find and cut off " (deleted)" from the path */
+    char *deleted = executable + strlen(executable) - strlen(" (deleted)");
+    if (deleted > executable && strcmp(deleted, " (deleted)") == 0)
+    {
+        *deleted = '\0';
+        log("File '%s' seems to be deleted", executable);
+    }
+    /* find and cut off prelink suffixes from the path */
+    char *prelink = executable + strlen(executable) - strlen(".#prelink#.XXXXXX");
+    if (prelink > executable && strncmp(prelink, ".#prelink#.", strlen(".#prelink#.")) == 0)
+    {
+        log("File '%s' seems to be a prelink temporary file", executable);
+        *prelink = '\0';
+    }
+    return executable;
+}
+
+static char* get_cwd(pid_t pid)
+{
+    char buf[sizeof("/proc/%lu/cwd") + sizeof(long)*3];
+    sprintf(buf, "/proc/%lu/cwd", (long)pid);
+    return malloc_readlink(buf);
+}
+
+static char* get_rootdir(pid_t pid)
+{
+    char buf[sizeof("/proc/%lu/root") + sizeof(long)*3];
+    sprintf(buf, "/proc/%lu/root", (long)pid);
+    return malloc_readlink(buf);
+}
+
+static int get_fsuid(void)
+{
+    int real, euid, saved;
+    /* if we fail to parse the uid, then make it root only readable to be safe */
+    int fs_uid = 0;
+
+    char *line = proc_pid_status; /* never NULL */
+    for (;;)
+    {
+        if (strncmp(line, "Uid", 3) == 0)
+        {
+            int n = sscanf(line, "Uid:\t%d\t%d\t%d\t%d\n", &real, &euid, &saved, &fs_uid);
+            if (n != 4)
+            {
+                perror_msg_and_die("Can't parse Uid: line");
+            }
+            break;
+        }
+        line = strchr(line, '\n');
+        if (!line)
+            break;
+        line++;
+    }
+
+    return fs_uid;
+}
+
+static int dump_suid_policy()
+{
+    /*
+     - values are:
+       0 - don't dump suided programs - in this case the hook is not called by kernel
+       1 - create coredump readable by fs_uid
+       2 - create coredump readable by root only
+    */
+    int c;
+    int suid_dump_policy = 0;
+    const char *filename = "/proc/sys/fs/suid_dumpable";
+    FILE *f  = fopen(filename, "r");
+    if (!f)
+    {
+        log("Can't open %s", filename);
+        return suid_dump_policy;
+    }
+
+    c = fgetc(f);
+    fclose(f);
+    if (c != EOF)
+        suid_dump_policy = c - '0';
+
+    //log("suid dump policy is: %i", suid_dump_policy);
+    return suid_dump_policy;
+}
+
+static int open_user_core(uid_t uid, uid_t fsuid, pid_t pid, char **percent_values)
+{
+    errno = 0;
+    if (user_pwd == NULL
+     || chdir(user_pwd) != 0
+    ) {
+        perror_msg("Can't cd to '%s'", user_pwd);
+        return -1;
+    }
+
+    struct passwd* pw = getpwuid(uid);
+    gid_t gid = pw ? pw->pw_gid : uid;
+    //log("setting uid: %i gid: %i", uid, gid);
+    xsetegid(gid);
+    xseteuid(fsuid);
+
+    if (strcmp(core_basename, "core") == 0)
+    {
+        /* Mimic "core.PID" if requested */
+        char buf[] = "0\n";
+        int fd = open("/proc/sys/kernel/core_uses_pid", O_RDONLY);
+        if (fd >= 0)
+        {
+            IGNORE_RESULT(read(fd, buf, sizeof(buf)));
+            close(fd);
+        }
+        if (strcmp(buf, "1\n") == 0)
+        {
+            core_basename = xasprintf("%s.%lu", core_basename, (long)pid);
+        }
+    }
+    else
+    {
+        /* Expand old core pattern, put expanded name in core_basename */
+        core_basename = xstrdup(core_basename);
+        unsigned idx = 0;
+        while (1)
+        {
+            char c = core_basename[idx];
+            if (!c)
+                break;
+            idx++;
+            if (c != '%')
+                continue;
+
+            /* We just copied %, look at following char and expand %c */
+            c = core_basename[idx];
+            unsigned specifier_num = strchrnul(percent_specifiers, c) - percent_specifiers;
+            if (percent_specifiers[specifier_num] != '\0') /* valid %c (might be %% too) */
+            {
+                const char *val = "%";
+                if (specifier_num > 0) /* not %% */
+                    val = percent_values[specifier_num - 1];
+                //log("c:'%c'", c);
+                //log("val:'%s'", val);
+
+                /* Replace %c at core_basename[idx] by its value */
+                idx--;
+                char *old = core_basename;
+                core_basename = xasprintf("%.*s%s%s", idx, core_basename, val, core_basename + idx + 2);
+                //log("pos:'%*s|'", idx, "");
+                //log("new:'%s'", core_basename);
+                //log("old:'%s'", old);
+                free(old);
+                idx += strlen(val);
+            }
+            /* else: invalid %c, % is already copied verbatim,
+             * next loop iteration will copy c */
+        }
+    }
+
+    full_core_basename = core_basename;
+    if (core_basename[0] != '/')
+        core_basename = concat_path_file(user_pwd, core_basename);
+
+    /* Open (create) compat core file.
+     * man core:
+     * There are various circumstances in which a core dump file
+     * is not produced:
+     *
+     * [skipped obvious ones]
+     * The process does not have permission to write the core file.
+     * ...if a file with the same name exists and is not writable
+     * or is not a regular file (e.g., it is a directory or a symbolic link).
+     *
+     * A file with the same name already exists, but there is more
+     * than one hard link to that file.
+     *
+     * The file system where the core dump file would be created is full;
+     * or has run out of inodes; or is mounted read-only;
+     * or the user has reached their quota for the file system.
+     *
+     * The RLIMIT_CORE or RLIMIT_FSIZE resource limits for the process
+     * are set to zero.
+     * [we check RLIMIT_CORE, but how can we check RLIMIT_FSIZE?]
+     *
+     * The binary being executed by the process does not have
+     * read permission enabled. [how we can check it here?]
+     *
+     * The process is executing a set-user-ID (set-group-ID) program
+     * that is owned by a user (group) other than the real
+     * user (group) ID of the process. [TODO?]
+     * (However, see the description of the prctl(2) PR_SET_DUMPABLE operation,
+     * and the description of the /proc/sys/fs/suid_dumpable file in proc(5).)
+     */
+    struct stat sb;
+    errno = 0;
+    /* Do not O_TRUNC: if later checks fail, we do not want to have file already modified here */
+    int user_core_fd = open(core_basename, O_WRONLY | O_CREAT | O_NOFOLLOW, 0600); /* kernel makes 0600 too */
+    xsetegid(0);
+    xseteuid(0);
+    if (user_core_fd < 0
+     || fstat(user_core_fd, &sb) != 0
+     || !S_ISREG(sb.st_mode)
+     || sb.st_nlink != 1
+    /* kernel internal dumper checks this too: if (inode->i_uid != current->fsuid) <fail>, need to mimic? */
+    ) {
+        if (user_core_fd < 0)
+            perror_msg("Can't open '%s'", full_core_basename);
+        else
+            perror_msg("'%s' is not a regular file with link count 1", full_core_basename);
+        return -1;
+    }
+    if (ftruncate(user_core_fd, 0) != 0) {
+        /* perror first, otherwise unlink may trash errno */
+        perror_msg("Can't truncate '%s' to size 0", full_core_basename);
+        unlink(core_basename);
+        return -1;
+    }
+
+    return user_core_fd;
+}
+
+static bool dump_fd_info(const char *dest_filename, char *source_filename, int source_base_ofs, uid_t uid, gid_t gid)
+{
+    //response
+    FILE *fp = fopen(dest_filename, "w");

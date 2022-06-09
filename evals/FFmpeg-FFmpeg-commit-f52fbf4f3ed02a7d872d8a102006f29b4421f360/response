@@ -1,0 +1,182 @@
+//c file
+/*
+ * Chronomaster DFA Video Decoder
+ * Copyright (c) 2011 Konstantin Shishkov
+ * based on work by Vladimir "VAG" Gneushev
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include <inttypes.h>
+
+#include "avcodec.h"
+#include "bytestream.h"
+#include "internal.h"
+
+#include "libavutil/avassert.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+
+typedef struct DfaContext {
+    uint32_t pal[256];
+    uint8_t *frame_buf;
+} DfaContext;
+
+static av_cold int dfa_decode_init(AVCodecContext *avctx)
+{
+    DfaContext *s = avctx->priv_data;
+
+    avctx->pix_fmt = AV_PIX_FMT_PAL8;
+
+    if (!avctx->width || !avctx->height)
+        return AVERROR_INVALIDDATA;
+
+    av_assert0(av_image_check_size(avctx->width, avctx->height, 0, avctx) >= 0);
+
+    s->frame_buf = av_mallocz(avctx->width * avctx->height);
+    if (!s->frame_buf)
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+
+static int decode_copy(GetByteContext *gb, uint8_t *frame, int width, int height)
+{
+    const int size = width * height;
+
+    if (bytestream2_get_buffer(gb, frame, size) != size)
+        return AVERROR_INVALIDDATA;
+    return 0;
+}
+
+static int decode_tsw1(GetByteContext *gb, uint8_t *frame, int width, int height)
+{
+    const uint8_t *frame_start = frame;
+    const uint8_t *frame_end   = frame + width * height;
+    int mask = 0x10000, bitbuf = 0;
+    int v, count, segments;
+    unsigned offset;
+
+    segments = bytestream2_get_le32(gb);
+    offset   = bytestream2_get_le32(gb);
+    if (segments == 0 && offset == frame_end - frame)
+        return 0; // skip frame
+    if (frame_end - frame <= offset)
+        return AVERROR_INVALIDDATA;
+    frame += offset;
+    while (segments--) {
+        if (bytestream2_get_bytes_left(gb) < 2)
+            return AVERROR_INVALIDDATA;
+        if (mask == 0x10000) {
+            bitbuf = bytestream2_get_le16u(gb);
+            mask = 1;
+        }
+        if (frame_end - frame < 2)
+            return AVERROR_INVALIDDATA;
+        if (bitbuf & mask) {
+            v = bytestream2_get_le16(gb);
+            offset = (v & 0x1FFF) << 1;
+            count = ((v >> 13) + 2) << 1;
+            if (frame - frame_start < offset || frame_end - frame < count)
+                return AVERROR_INVALIDDATA;
+            av_memcpy_backptr(frame, offset, count);
+            frame += count;
+        } else {
+            *frame++ = bytestream2_get_byte(gb);
+            *frame++ = bytestream2_get_byte(gb);
+        }
+        mask <<= 1;
+    }
+
+    return 0;
+}
+
+static int decode_dsw1(GetByteContext *gb, uint8_t *frame, int width, int height)
+{
+    const uint8_t *frame_start = frame;
+    const uint8_t *frame_end   = frame + width * height;
+    int mask = 0x10000, bitbuf = 0;
+    int v, offset, count, segments;
+
+    segments = bytestream2_get_le16(gb);
+    while (segments--) {
+        if (bytestream2_get_bytes_left(gb) < 2)
+            return AVERROR_INVALIDDATA;
+        if (mask == 0x10000) {
+            bitbuf = bytestream2_get_le16u(gb);
+            mask = 1;
+        }
+        if (frame_end - frame < 2)
+            return AVERROR_INVALIDDATA;
+        if (bitbuf & mask) {
+            v = bytestream2_get_le16(gb);
+            offset = (v & 0x1FFF) << 1;
+            count = ((v >> 13) + 2) << 1;
+            if (frame - frame_start < offset || frame_end - frame < count)
+                return AVERROR_INVALIDDATA;
+            av_memcpy_backptr(frame, offset, count);
+            frame += count;
+        } else if (bitbuf & (mask << 1)) {
+            frame += bytestream2_get_le16(gb);
+        } else {
+            *frame++ = bytestream2_get_byte(gb);
+            *frame++ = bytestream2_get_byte(gb);
+        }
+        mask <<= 2;
+    }
+
+    return 0;
+}
+
+static int decode_dds1(GetByteContext *gb, uint8_t *frame, int width, int height)
+{
+    const uint8_t *frame_start = frame;
+    const uint8_t *frame_end   = frame + width * height;
+    int mask = 0x10000, bitbuf = 0;
+    int i, v, offset, count, segments;
+
+    segments = bytestream2_get_le16(gb);
+    while (segments--) {
+        if (bytestream2_get_bytes_left(gb) < 2)
+            return AVERROR_INVALIDDATA;
+        if (mask == 0x10000) {
+            bitbuf = bytestream2_get_le16u(gb);
+            mask = 1;
+        }
+
+        if (bitbuf & mask) {
+            v = bytestream2_get_le16(gb);
+            offset = (v & 0x1FFF) << 2;
+            count = ((v >> 13) + 2) << 1;
+            if (frame - frame_start < offset || frame_end - frame < count*2 + width)
+                return AVERROR_INVALIDDATA;
+            for (i = 0; i < count; i++) {
+                frame[0] = frame[1] =
+                frame[width] = frame[width + 1] = frame[-offset];
+
+                frame += 2;
+            }
+        } else if (bitbuf & (mask << 1)) {
+            v = bytestream2_get_le16(gb)*2;
+            if (frame - frame_end < v)
+                return AVERROR_INVALIDDATA;
+            frame += v;
+        } else {
+
+            //response
+            if (frame_end - frame < width + 1)
+                return AVERROR_INVALIDDATA;

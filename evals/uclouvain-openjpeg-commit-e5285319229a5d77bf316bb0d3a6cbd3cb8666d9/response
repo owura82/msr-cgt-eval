@@ -1,0 +1,1195 @@
+//c file
+/*
+ * The copyright in this software is being made available under the 2-clauses
+ * BSD License, included below. This software may be subject to other third
+ * party and contributor rights, including patent rights, and no such rights
+ * are granted under this license.
+ *
+ * Copyright (c) 2002-2014, Universite catholique de Louvain (UCL), Belgium
+ * Copyright (c) 2002-2014, Professor Benoit Macq
+ * Copyright (c) 2001-2003, David Janssens
+ * Copyright (c) 2002-2003, Yannick Verschueren
+ * Copyright (c) 2003-2007, Francois-Olivier Devaux
+ * Copyright (c) 2003-2014, Antonin Descampe
+ * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * Copyright (c) 2006-2007, Parvatha Elangovan
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS `AS IS'
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "opj_apps_config.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <limits.h>
+
+#include "openjpeg.h"
+#include "convert.h"
+
+/*
+ * Get logarithm of an integer and round downwards.
+ *
+ * log2(a)
+ */
+static int int_floorlog2(int a)
+{
+    int l;
+    for (l = 0; a > 1; l++) {
+        a >>= 1;
+    }
+    return l;
+}
+
+/* Component precision scaling */
+void clip_component(opj_image_comp_t* component, OPJ_UINT32 precision)
+{
+    OPJ_SIZE_T i;
+    OPJ_SIZE_T len;
+    OPJ_UINT32 umax = (OPJ_UINT32)((OPJ_INT32) - 1);
+
+    len = (OPJ_SIZE_T)component->w * (OPJ_SIZE_T)component->h;
+    if (precision < 32) {
+        umax = (1U << precision) - 1U;
+    }
+
+    if (component->sgnd) {
+        OPJ_INT32* l_data = component->data;
+        OPJ_INT32 max = (OPJ_INT32)(umax / 2U);
+        OPJ_INT32 min = -max - 1;
+        for (i = 0; i < len; ++i) {
+            if (l_data[i] > max) {
+                l_data[i] = max;
+            } else if (l_data[i] < min) {
+                l_data[i] = min;
+            }
+        }
+    } else {
+        OPJ_UINT32* l_data = (OPJ_UINT32*)component->data;
+        for (i = 0; i < len; ++i) {
+            if (l_data[i] > umax) {
+                l_data[i] = umax;
+            }
+        }
+    }
+    component->prec = precision;
+}
+
+/* Component precision scaling */
+static void scale_component_up(opj_image_comp_t* component,
+                               OPJ_UINT32 precision)
+{
+    OPJ_SIZE_T i, len;
+
+    len = (OPJ_SIZE_T)component->w * (OPJ_SIZE_T)component->h;
+    if (component->sgnd) {
+        OPJ_INT64  newMax = (OPJ_INT64)(1U << (precision - 1));
+        OPJ_INT64  oldMax = (OPJ_INT64)(1U << (component->prec - 1));
+        OPJ_INT32* l_data = component->data;
+        for (i = 0; i < len; ++i) {
+            l_data[i] = (OPJ_INT32)(((OPJ_INT64)l_data[i] * newMax) / oldMax);
+        }
+    } else {
+        OPJ_UINT64  newMax = (OPJ_UINT64)((1U << precision) - 1U);
+        OPJ_UINT64  oldMax = (OPJ_UINT64)((1U << component->prec) - 1U);
+        OPJ_UINT32* l_data = (OPJ_UINT32*)component->data;
+        for (i = 0; i < len; ++i) {
+            l_data[i] = (OPJ_UINT32)(((OPJ_UINT64)l_data[i] * newMax) / oldMax);
+        }
+    }
+    component->prec = precision;
+    component->bpp = precision;
+}
+void scale_component(opj_image_comp_t* component, OPJ_UINT32 precision)
+{
+    int shift;
+    OPJ_SIZE_T i, len;
+
+    if (component->prec == precision) {
+        return;
+    }
+    if (component->prec < precision) {
+        scale_component_up(component, precision);
+        return;
+    }
+    shift = (int)(component->prec - precision);
+    len = (OPJ_SIZE_T)component->w * (OPJ_SIZE_T)component->h;
+    if (component->sgnd) {
+        OPJ_INT32* l_data = component->data;
+        for (i = 0; i < len; ++i) {
+            l_data[i] >>= shift;
+        }
+    } else {
+        OPJ_UINT32* l_data = (OPJ_UINT32*)component->data;
+        for (i = 0; i < len; ++i) {
+            l_data[i] >>= shift;
+        }
+    }
+    component->bpp = precision;
+    component->prec = precision;
+}
+
+
+/* planar / interleaved conversions */
+/* used by PNG/TIFF */
+static void convert_32s_C1P1(const OPJ_INT32* pSrc, OPJ_INT32* const* pDst,
+                             OPJ_SIZE_T length)
+{
+    memcpy(pDst[0], pSrc, length * sizeof(OPJ_INT32));
+}
+static void convert_32s_C2P2(const OPJ_INT32* pSrc, OPJ_INT32* const* pDst,
+                             OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    OPJ_INT32* pDst0 = pDst[0];
+    OPJ_INT32* pDst1 = pDst[1];
+
+    for (i = 0; i < length; i++) {
+        pDst0[i] = pSrc[2 * i + 0];
+        pDst1[i] = pSrc[2 * i + 1];
+    }
+}
+static void convert_32s_C3P3(const OPJ_INT32* pSrc, OPJ_INT32* const* pDst,
+                             OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    OPJ_INT32* pDst0 = pDst[0];
+    OPJ_INT32* pDst1 = pDst[1];
+    OPJ_INT32* pDst2 = pDst[2];
+
+    for (i = 0; i < length; i++) {
+        pDst0[i] = pSrc[3 * i + 0];
+        pDst1[i] = pSrc[3 * i + 1];
+        pDst2[i] = pSrc[3 * i + 2];
+    }
+}
+static void convert_32s_C4P4(const OPJ_INT32* pSrc, OPJ_INT32* const* pDst,
+                             OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    OPJ_INT32* pDst0 = pDst[0];
+    OPJ_INT32* pDst1 = pDst[1];
+    OPJ_INT32* pDst2 = pDst[2];
+    OPJ_INT32* pDst3 = pDst[3];
+
+    for (i = 0; i < length; i++) {
+        pDst0[i] = pSrc[4 * i + 0];
+        pDst1[i] = pSrc[4 * i + 1];
+        pDst2[i] = pSrc[4 * i + 2];
+        pDst3[i] = pSrc[4 * i + 3];
+    }
+}
+const convert_32s_CXPX convert_32s_CXPX_LUT[5] = {
+    NULL,
+    convert_32s_C1P1,
+    convert_32s_C2P2,
+    convert_32s_C3P3,
+    convert_32s_C4P4
+};
+
+static void convert_32s_P1C1(OPJ_INT32 const* const* pSrc, OPJ_INT32* pDst,
+                             OPJ_SIZE_T length, OPJ_INT32 adjust)
+{
+    OPJ_SIZE_T i;
+    const OPJ_INT32* pSrc0 = pSrc[0];
+
+    for (i = 0; i < length; i++) {
+        pDst[i] = pSrc0[i] + adjust;
+    }
+}
+static void convert_32s_P2C2(OPJ_INT32 const* const* pSrc, OPJ_INT32* pDst,
+                             OPJ_SIZE_T length, OPJ_INT32 adjust)
+{
+    OPJ_SIZE_T i;
+    const OPJ_INT32* pSrc0 = pSrc[0];
+    const OPJ_INT32* pSrc1 = pSrc[1];
+
+    for (i = 0; i < length; i++) {
+        pDst[2 * i + 0] = pSrc0[i] + adjust;
+        pDst[2 * i + 1] = pSrc1[i] + adjust;
+    }
+}
+static void convert_32s_P3C3(OPJ_INT32 const* const* pSrc, OPJ_INT32* pDst,
+                             OPJ_SIZE_T length, OPJ_INT32 adjust)
+{
+    OPJ_SIZE_T i;
+    const OPJ_INT32* pSrc0 = pSrc[0];
+    const OPJ_INT32* pSrc1 = pSrc[1];
+    const OPJ_INT32* pSrc2 = pSrc[2];
+
+    for (i = 0; i < length; i++) {
+        pDst[3 * i + 0] = pSrc0[i] + adjust;
+        pDst[3 * i + 1] = pSrc1[i] + adjust;
+        pDst[3 * i + 2] = pSrc2[i] + adjust;
+    }
+}
+static void convert_32s_P4C4(OPJ_INT32 const* const* pSrc, OPJ_INT32* pDst,
+                             OPJ_SIZE_T length, OPJ_INT32 adjust)
+{
+    OPJ_SIZE_T i;
+    const OPJ_INT32* pSrc0 = pSrc[0];
+    const OPJ_INT32* pSrc1 = pSrc[1];
+    const OPJ_INT32* pSrc2 = pSrc[2];
+    const OPJ_INT32* pSrc3 = pSrc[3];
+
+    for (i = 0; i < length; i++) {
+        pDst[4 * i + 0] = pSrc0[i] + adjust;
+        pDst[4 * i + 1] = pSrc1[i] + adjust;
+        pDst[4 * i + 2] = pSrc2[i] + adjust;
+        pDst[4 * i + 3] = pSrc3[i] + adjust;
+    }
+}
+const convert_32s_PXCX convert_32s_PXCX_LUT[5] = {
+    NULL,
+    convert_32s_P1C1,
+    convert_32s_P2C2,
+    convert_32s_P3C3,
+    convert_32s_P4C4
+};
+
+/* bit depth conversions */
+/* used by PNG/TIFF up to 8bpp */
+static void convert_1u32s_C1R(const OPJ_BYTE* pSrc, OPJ_INT32* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)7U); i += 8U) {
+        OPJ_UINT32 val = *pSrc++;
+        pDst[i + 0] = (OPJ_INT32)(val >> 7);
+        pDst[i + 1] = (OPJ_INT32)((val >> 6) & 0x1U);
+        pDst[i + 2] = (OPJ_INT32)((val >> 5) & 0x1U);
+        pDst[i + 3] = (OPJ_INT32)((val >> 4) & 0x1U);
+        pDst[i + 4] = (OPJ_INT32)((val >> 3) & 0x1U);
+        pDst[i + 5] = (OPJ_INT32)((val >> 2) & 0x1U);
+        pDst[i + 6] = (OPJ_INT32)((val >> 1) & 0x1U);
+        pDst[i + 7] = (OPJ_INT32)(val & 0x1U);
+    }
+    if (length & 7U) {
+        OPJ_UINT32 val = *pSrc++;
+        length = length & 7U;
+        pDst[i + 0] = (OPJ_INT32)(val >> 7);
+
+        if (length > 1U) {
+            pDst[i + 1] = (OPJ_INT32)((val >> 6) & 0x1U);
+            if (length > 2U) {
+                pDst[i + 2] = (OPJ_INT32)((val >> 5) & 0x1U);
+                if (length > 3U) {
+                    pDst[i + 3] = (OPJ_INT32)((val >> 4) & 0x1U);
+                    if (length > 4U) {
+                        pDst[i + 4] = (OPJ_INT32)((val >> 3) & 0x1U);
+                        if (length > 5U) {
+                            pDst[i + 5] = (OPJ_INT32)((val >> 2) & 0x1U);
+                            if (length > 6U) {
+                                pDst[i + 6] = (OPJ_INT32)((val >> 1) & 0x1U);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+static void convert_2u32s_C1R(const OPJ_BYTE* pSrc, OPJ_INT32* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)3U); i += 4U) {
+        OPJ_UINT32 val = *pSrc++;
+        pDst[i + 0] = (OPJ_INT32)(val >> 6);
+        pDst[i + 1] = (OPJ_INT32)((val >> 4) & 0x3U);
+        pDst[i + 2] = (OPJ_INT32)((val >> 2) & 0x3U);
+        pDst[i + 3] = (OPJ_INT32)(val & 0x3U);
+    }
+    if (length & 3U) {
+        OPJ_UINT32 val = *pSrc++;
+        length = length & 3U;
+        pDst[i + 0] = (OPJ_INT32)(val >> 6);
+
+        if (length > 1U) {
+            pDst[i + 1] = (OPJ_INT32)((val >> 4) & 0x3U);
+            if (length > 2U) {
+                pDst[i + 2] = (OPJ_INT32)((val >> 2) & 0x3U);
+
+            }
+        }
+    }
+}
+static void convert_4u32s_C1R(const OPJ_BYTE* pSrc, OPJ_INT32* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)1U); i += 2U) {
+        OPJ_UINT32 val = *pSrc++;
+        pDst[i + 0] = (OPJ_INT32)(val >> 4);
+        pDst[i + 1] = (OPJ_INT32)(val & 0xFU);
+    }
+    if (length & 1U) {
+        OPJ_UINT8 val = *pSrc++;
+        pDst[i + 0] = (OPJ_INT32)(val >> 4);
+    }
+}
+static void convert_6u32s_C1R(const OPJ_BYTE* pSrc, OPJ_INT32* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)3U); i += 4U) {
+        OPJ_UINT32 val0 = *pSrc++;
+        OPJ_UINT32 val1 = *pSrc++;
+        OPJ_UINT32 val2 = *pSrc++;
+        pDst[i + 0] = (OPJ_INT32)(val0 >> 2);
+        pDst[i + 1] = (OPJ_INT32)(((val0 & 0x3U) << 4) | (val1 >> 4));
+        pDst[i + 2] = (OPJ_INT32)(((val1 & 0xFU) << 2) | (val2 >> 6));
+        pDst[i + 3] = (OPJ_INT32)(val2 & 0x3FU);
+
+    }
+    if (length & 3U) {
+        OPJ_UINT32 val0 = *pSrc++;
+        length = length & 3U;
+        pDst[i + 0] = (OPJ_INT32)(val0 >> 2);
+
+        if (length > 1U) {
+            OPJ_UINT32 val1 = *pSrc++;
+            pDst[i + 1] = (OPJ_INT32)(((val0 & 0x3U) << 4) | (val1 >> 4));
+            if (length > 2U) {
+                OPJ_UINT32 val2 = *pSrc++;
+                pDst[i + 2] = (OPJ_INT32)(((val1 & 0xFU) << 2) | (val2 >> 6));
+            }
+        }
+    }
+}
+static void convert_8u32s_C1R(const OPJ_BYTE* pSrc, OPJ_INT32* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < length; i++) {
+        pDst[i] = pSrc[i];
+    }
+}
+const convert_XXx32s_C1R convert_XXu32s_C1R_LUT[9] = {
+    NULL,
+    convert_1u32s_C1R,
+    convert_2u32s_C1R,
+    NULL,
+    convert_4u32s_C1R,
+    NULL,
+    convert_6u32s_C1R,
+    NULL,
+    convert_8u32s_C1R
+};
+
+
+static void convert_32s1u_C1R(const OPJ_INT32* pSrc, OPJ_BYTE* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)7U); i += 8U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = (OPJ_UINT32)pSrc[i + 1];
+        OPJ_UINT32 src2 = (OPJ_UINT32)pSrc[i + 2];
+        OPJ_UINT32 src3 = (OPJ_UINT32)pSrc[i + 3];
+        OPJ_UINT32 src4 = (OPJ_UINT32)pSrc[i + 4];
+        OPJ_UINT32 src5 = (OPJ_UINT32)pSrc[i + 5];
+        OPJ_UINT32 src6 = (OPJ_UINT32)pSrc[i + 6];
+        OPJ_UINT32 src7 = (OPJ_UINT32)pSrc[i + 7];
+
+        *pDst++ = (OPJ_BYTE)((src0 << 7) | (src1 << 6) | (src2 << 5) | (src3 << 4) |
+                             (src4 << 3) | (src5 << 2) | (src6 << 1) | src7);
+    }
+
+    if (length & 7U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = 0U;
+        OPJ_UINT32 src2 = 0U;
+        OPJ_UINT32 src3 = 0U;
+        OPJ_UINT32 src4 = 0U;
+        OPJ_UINT32 src5 = 0U;
+        OPJ_UINT32 src6 = 0U;
+        length = length & 7U;
+
+        if (length > 1U) {
+            src1 = (OPJ_UINT32)pSrc[i + 1];
+            if (length > 2U) {
+                src2 = (OPJ_UINT32)pSrc[i + 2];
+                if (length > 3U) {
+                    src3 = (OPJ_UINT32)pSrc[i + 3];
+                    if (length > 4U) {
+                        src4 = (OPJ_UINT32)pSrc[i + 4];
+                        if (length > 5U) {
+                            src5 = (OPJ_UINT32)pSrc[i + 5];
+                            if (length > 6U) {
+                                src6 = (OPJ_UINT32)pSrc[i + 6];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        *pDst++ = (OPJ_BYTE)((src0 << 7) | (src1 << 6) | (src2 << 5) | (src3 << 4) |
+                             (src4 << 3) | (src5 << 2) | (src6 << 1));
+    }
+}
+
+static void convert_32s2u_C1R(const OPJ_INT32* pSrc, OPJ_BYTE* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)3U); i += 4U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = (OPJ_UINT32)pSrc[i + 1];
+        OPJ_UINT32 src2 = (OPJ_UINT32)pSrc[i + 2];
+        OPJ_UINT32 src3 = (OPJ_UINT32)pSrc[i + 3];
+
+        *pDst++ = (OPJ_BYTE)((src0 << 6) | (src1 << 4) | (src2 << 2) | src3);
+    }
+
+    if (length & 3U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = 0U;
+        OPJ_UINT32 src2 = 0U;
+        length = length & 3U;
+
+        if (length > 1U) {
+            src1 = (OPJ_UINT32)pSrc[i + 1];
+            if (length > 2U) {
+                src2 = (OPJ_UINT32)pSrc[i + 2];
+            }
+        }
+        *pDst++ = (OPJ_BYTE)((src0 << 6) | (src1 << 4) | (src2 << 2));
+    }
+}
+
+static void convert_32s4u_C1R(const OPJ_INT32* pSrc, OPJ_BYTE* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)1U); i += 2U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = (OPJ_UINT32)pSrc[i + 1];
+
+        *pDst++ = (OPJ_BYTE)((src0 << 4) | src1);
+    }
+
+    if (length & 1U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        *pDst++ = (OPJ_BYTE)((src0 << 4));
+    }
+}
+
+static void convert_32s6u_C1R(const OPJ_INT32* pSrc, OPJ_BYTE* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < (length & ~(OPJ_SIZE_T)3U); i += 4U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = (OPJ_UINT32)pSrc[i + 1];
+        OPJ_UINT32 src2 = (OPJ_UINT32)pSrc[i + 2];
+        OPJ_UINT32 src3 = (OPJ_UINT32)pSrc[i + 3];
+
+        *pDst++ = (OPJ_BYTE)((src0 << 2) | (src1 >> 4));
+        *pDst++ = (OPJ_BYTE)(((src1 & 0xFU) << 4) | (src2 >> 2));
+        *pDst++ = (OPJ_BYTE)(((src2 & 0x3U) << 6) | src3);
+    }
+
+    if (length & 3U) {
+        OPJ_UINT32 src0 = (OPJ_UINT32)pSrc[i + 0];
+        OPJ_UINT32 src1 = 0U;
+        OPJ_UINT32 src2 = 0U;
+        length = length & 3U;
+
+        if (length > 1U) {
+            src1 = (OPJ_UINT32)pSrc[i + 1];
+            if (length > 2U) {
+                src2 = (OPJ_UINT32)pSrc[i + 2];
+            }
+        }
+        *pDst++ = (OPJ_BYTE)((src0 << 2) | (src1 >> 4));
+        if (length > 1U) {
+            *pDst++ = (OPJ_BYTE)(((src1 & 0xFU) << 4) | (src2 >> 2));
+            if (length > 2U) {
+                *pDst++ = (OPJ_BYTE)(((src2 & 0x3U) << 6));
+            }
+        }
+    }
+}
+static void convert_32s8u_C1R(const OPJ_INT32* pSrc, OPJ_BYTE* pDst,
+                              OPJ_SIZE_T length)
+{
+    OPJ_SIZE_T i;
+    for (i = 0; i < length; ++i) {
+        pDst[i] = (OPJ_BYTE)pSrc[i];
+    }
+}
+const convert_32sXXx_C1R convert_32sXXu_C1R_LUT[9] = {
+    NULL,
+    convert_32s1u_C1R,
+    convert_32s2u_C1R,
+    NULL,
+    convert_32s4u_C1R,
+    NULL,
+    convert_32s6u_C1R,
+    NULL,
+    convert_32s8u_C1R
+};
+
+/* -->> -->> -->> -->>
+
+  TGA IMAGE FORMAT
+
+ <<-- <<-- <<-- <<-- */
+
+#ifdef INFORMATION_ONLY
+/* TGA header definition. */
+struct tga_header {
+    unsigned char   id_length;              /* Image id field length    */
+    unsigned char   colour_map_type;        /* Colour map type          */
+    unsigned char   image_type;             /* Image type               */
+    /*
+    ** Colour map specification
+    */
+    unsigned short  colour_map_index;       /* First entry index        */
+    unsigned short  colour_map_length;      /* Colour map length        */
+    unsigned char   colour_map_entry_size;  /* Colour map entry size    */
+    /*
+    ** Image specification
+    */
+    unsigned short  x_origin;               /* x origin of image        */
+    unsigned short  y_origin;               /* u origin of image        */
+    unsigned short  image_width;            /* Image width              */
+    unsigned short  image_height;           /* Image height             */
+    unsigned char   pixel_depth;            /* Pixel depth              */
+    unsigned char   image_desc;             /* Image descriptor         */
+};
+#endif /* INFORMATION_ONLY */
+
+/* Returns a ushort from a little-endian serialized value */
+static unsigned short get_tga_ushort(const unsigned char *data)
+{
+    return (unsigned short)(data[0] | (data[1] << 8));
+}
+
+#define TGA_HEADER_SIZE 18
+
+static int tga_readheader(FILE *fp, unsigned int *bits_per_pixel,
+                          unsigned int *width, unsigned int *height, int *flip_image)
+{
+    int palette_size;
+    unsigned char tga[TGA_HEADER_SIZE];
+    unsigned char id_len, /*cmap_type,*/ image_type;
+    unsigned char pixel_depth, image_desc;
+    unsigned short /*cmap_index,*/ cmap_len, cmap_entry_size;
+    unsigned short /*x_origin, y_origin,*/ image_w, image_h;
+
+    if (!bits_per_pixel || !width || !height || !flip_image) {
+        return 0;
+    }
+
+    if (fread(tga, TGA_HEADER_SIZE, 1, fp) != 1) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0 ;
+    }
+    id_len = tga[0];
+    /*cmap_type = tga[1];*/
+    image_type = tga[2];
+    /*cmap_index = get_tga_ushort(&tga[3]);*/
+    cmap_len = get_tga_ushort(&tga[5]);
+    cmap_entry_size = tga[7];
+
+
+#if 0
+    x_origin = get_tga_ushort(&tga[8]);
+    y_origin = get_tga_ushort(&tga[10]);
+#endif
+    image_w = get_tga_ushort(&tga[12]);
+    image_h = get_tga_ushort(&tga[14]);
+    pixel_depth = tga[16];
+    image_desc  = tga[17];
+
+    *bits_per_pixel = (unsigned int)pixel_depth;
+    *width  = (unsigned int)image_w;
+    *height = (unsigned int)image_h;
+
+    /* Ignore tga identifier, if present ... */
+    if (id_len) {
+        unsigned char *id = (unsigned char *) malloc(id_len);
+        if (id == 0) {
+            fprintf(stderr, "tga_readheader: memory out\n");
+            return 0;
+        }
+        if (!fread(id, id_len, 1, fp)) {
+            fprintf(stderr,
+                    "\nError: fread return a number of element different from the expected.\n");
+            free(id);
+            return 0 ;
+        }
+        free(id);
+    }
+
+    /* Test for compressed formats ... not yet supported ...
+    // Note :-  9 - RLE encoded palettized.
+    //         10 - RLE encoded RGB. */
+    if (image_type > 8) {
+        fprintf(stderr, "Sorry, compressed tga files are not currently supported.\n");
+        return 0 ;
+    }
+
+    *flip_image = !(image_desc & 32);
+
+    /* Palettized formats are not yet supported, skip over the palette, if present ... */
+    palette_size = cmap_len * (cmap_entry_size / 8);
+
+    if (palette_size > 0) {
+        fprintf(stderr, "File contains a palette - not yet supported.");
+        fseek(fp, palette_size, SEEK_CUR);
+    }
+    return 1;
+}
+
+#ifdef OPJ_BIG_ENDIAN
+
+static INLINE OPJ_UINT16 swap16(OPJ_UINT16 x)
+{
+    return (OPJ_UINT16)(((x & 0x00ffU) <<  8) | ((x & 0xff00U) >>  8));
+}
+
+#endif
+
+static int tga_writeheader(FILE *fp, int bits_per_pixel, int width, int height,
+                           OPJ_BOOL flip_image)
+{
+    OPJ_UINT16 image_w, image_h, us0;
+    unsigned char uc0, image_type;
+    unsigned char pixel_depth, image_desc;
+
+    if (!bits_per_pixel || !width || !height) {
+        return 0;
+    }
+
+    pixel_depth = 0;
+
+    if (bits_per_pixel < 256) {
+        pixel_depth = (unsigned char)bits_per_pixel;
+    } else {
+        fprintf(stderr, "ERROR: Wrong bits per pixel inside tga_header");
+        return 0;
+    }
+    uc0 = 0;
+
+    if (fwrite(&uc0, 1, 1, fp) != 1) {
+        goto fails;    /* id_length */
+    }
+    if (fwrite(&uc0, 1, 1, fp) != 1) {
+        goto fails;    /* colour_map_type */
+    }
+
+    image_type = 2; /* Uncompressed. */
+    if (fwrite(&image_type, 1, 1, fp) != 1) {
+        goto fails;
+    }
+
+    us0 = 0;
+    if (fwrite(&us0, 2, 1, fp) != 1) {
+        goto fails;    /* colour_map_index */
+    }
+    if (fwrite(&us0, 2, 1, fp) != 1) {
+        goto fails;    /* colour_map_length */
+    }
+    if (fwrite(&uc0, 1, 1, fp) != 1) {
+        goto fails;    /* colour_map_entry_size */
+    }
+
+    if (fwrite(&us0, 2, 1, fp) != 1) {
+        goto fails;    /* x_origin */
+    }
+    if (fwrite(&us0, 2, 1, fp) != 1) {
+        goto fails;    /* y_origin */
+    }
+
+    image_w = (unsigned short)width;
+    image_h = (unsigned short) height;
+
+#ifndef OPJ_BIG_ENDIAN
+    if (fwrite(&image_w, 2, 1, fp) != 1) {
+        goto fails;
+    }
+    if (fwrite(&image_h, 2, 1, fp) != 1) {
+        goto fails;
+    }
+#else
+    image_w = swap16(image_w);
+    image_h = swap16(image_h);
+    if (fwrite(&image_w, 2, 1, fp) != 1) {
+        goto fails;
+    }
+    if (fwrite(&image_h, 2, 1, fp) != 1) {
+        goto fails;
+    }
+#endif
+
+    if (fwrite(&pixel_depth, 1, 1, fp) != 1) {
+        goto fails;
+    }
+
+    image_desc = 8; /* 8 bits per component. */
+
+    if (flip_image) {
+        image_desc |= 32;
+    }
+    if (fwrite(&image_desc, 1, 1, fp) != 1) {
+        goto fails;
+    }
+
+    return 1;
+
+fails:
+    fputs("\nwrite_tgaheader: write ERROR\n", stderr);
+    return 0;
+}
+
+opj_image_t* tgatoimage(const char *filename, opj_cparameters_t *parameters)
+{
+    FILE *f;
+    opj_image_t *image;
+    unsigned int image_width, image_height, pixel_bit_depth;
+    unsigned int x, y;
+    int flip_image = 0;
+    opj_image_cmptparm_t cmptparm[4];   /* maximum 4 components */
+    int numcomps;
+    OPJ_COLOR_SPACE color_space;
+    OPJ_BOOL mono ;
+    OPJ_BOOL save_alpha;
+    int subsampling_dx, subsampling_dy;
+    int i;
+
+    f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s for reading !!\n", filename);
+        return 0;
+    }
+
+    if (!tga_readheader(f, &pixel_bit_depth, &image_width, &image_height,
+                        &flip_image)) {
+        fclose(f);
+        return NULL;
+    }
+
+    /* We currently only support 24 & 32 bit tga's ... */
+    if (!((pixel_bit_depth == 24) || (pixel_bit_depth == 32))) {
+        fclose(f);
+        return NULL;
+    }
+
+    /* initialize image components */
+    memset(&cmptparm[0], 0, 4 * sizeof(opj_image_cmptparm_t));
+
+    mono = (pixel_bit_depth == 8) ||
+           (pixel_bit_depth == 16);  /* Mono with & without alpha. */
+    save_alpha = (pixel_bit_depth == 16) ||
+                 (pixel_bit_depth == 32); /* Mono with alpha, or RGB with alpha */
+
+    if (mono) {
+        color_space = OPJ_CLRSPC_GRAY;
+        numcomps = save_alpha ? 2 : 1;
+    } else {
+        numcomps = save_alpha ? 4 : 3;
+        color_space = OPJ_CLRSPC_SRGB;
+    }
+
+    /* If the declared file size is > 10 MB, check that the file is big */
+    /* enough to avoid excessive memory allocations */
+    if (image_height != 0 &&
+            image_width > 10000000U / image_height / (OPJ_UINT32)numcomps) {
+        char ch;
+        OPJ_UINT64 expected_file_size =
+            (OPJ_UINT64)image_width * image_height * (OPJ_UINT32)numcomps;
+        long curpos = ftell(f);
+        if (expected_file_size > (OPJ_UINT64)INT_MAX) {
+            expected_file_size = (OPJ_UINT64)INT_MAX;
+        }
+        fseek(f, (long)expected_file_size - 1, SEEK_SET);
+        if (fread(&ch, 1, 1, f) != 1) {
+            fclose(f);
+            return NULL;
+        }
+        fseek(f, curpos, SEEK_SET);
+    }
+
+    subsampling_dx = parameters->subsampling_dx;
+    subsampling_dy = parameters->subsampling_dy;
+
+    for (i = 0; i < numcomps; i++) {
+        cmptparm[i].prec = 8;
+        cmptparm[i].bpp = 8;
+        cmptparm[i].sgnd = 0;
+        cmptparm[i].dx = (OPJ_UINT32)subsampling_dx;
+        cmptparm[i].dy = (OPJ_UINT32)subsampling_dy;
+        cmptparm[i].w = image_width;
+        cmptparm[i].h = image_height;
+    }
+
+    /* create the image */
+    image = opj_image_create((OPJ_UINT32)numcomps, &cmptparm[0], color_space);
+
+    if (!image) {
+        fclose(f);
+        return NULL;
+    }
+
+
+    /* set image offset and reference grid */
+    image->x0 = (OPJ_UINT32)parameters->image_offset_x0;
+    image->y0 = (OPJ_UINT32)parameters->image_offset_y0;
+    image->x1 = !image->x0 ? (OPJ_UINT32)(image_width - 1)  *
+                (OPJ_UINT32)subsampling_dx + 1 : image->x0 + (OPJ_UINT32)(image_width - 1)  *
+                (OPJ_UINT32)subsampling_dx + 1;
+    image->y1 = !image->y0 ? (OPJ_UINT32)(image_height - 1) *
+                (OPJ_UINT32)subsampling_dy + 1 : image->y0 + (OPJ_UINT32)(image_height - 1) *
+                (OPJ_UINT32)subsampling_dy + 1;
+
+    /* set image data */
+    for (y = 0; y < image_height; y++) {
+        int index;
+
+        if (flip_image) {
+            index = (int)((image_height - y - 1) * image_width);
+        } else {
+            index = (int)(y * image_width);
+        }
+
+        if (numcomps == 3) {
+            for (x = 0; x < image_width; x++) {
+                unsigned char r, g, b;
+
+                if (!fread(&b, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+                if (!fread(&g, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+                if (!fread(&r, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+
+                image->comps[0].data[index] = r;
+                image->comps[1].data[index] = g;
+                image->comps[2].data[index] = b;
+                index++;
+            }
+        } else if (numcomps == 4) {
+            for (x = 0; x < image_width; x++) {
+                unsigned char r, g, b, a;
+                if (!fread(&b, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+                if (!fread(&g, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+                if (!fread(&r, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+                if (!fread(&a, 1, 1, f)) {
+                    fprintf(stderr,
+                            "\nError: fread return a number of element different from the expected.\n");
+                    opj_image_destroy(image);
+                    fclose(f);
+                    return NULL;
+                }
+
+                image->comps[0].data[index] = r;
+                image->comps[1].data[index] = g;
+                image->comps[2].data[index] = b;
+                image->comps[3].data[index] = a;
+                index++;
+            }
+        } else {
+            fprintf(stderr, "Currently unsupported bit depth : %s\n", filename);
+        }
+    }
+    fclose(f);
+    return image;
+}
+
+int imagetotga(opj_image_t * image, const char *outfile)
+{
+    int width, height, bpp, x, y;
+    OPJ_BOOL write_alpha;
+    unsigned int i;
+    int adjustR, adjustG = 0, adjustB = 0, fails;
+    unsigned int alpha_channel;
+    float r, g, b, a;
+    unsigned char value;
+    float scale;
+    FILE *fdest;
+    size_t res;
+    fails = 1;
+
+    fdest = fopen(outfile, "wb");
+    if (!fdest) {
+        fprintf(stderr, "ERROR -> failed to open %s for writing\n", outfile);
+        return 1;
+    }
+
+    for (i = 0; i < image->numcomps - 1; i++) {
+        if ((image->comps[0].dx != image->comps[i + 1].dx)
+                || (image->comps[0].dy != image->comps[i + 1].dy)
+                || (image->comps[0].prec != image->comps[i + 1].prec)
+                || (image->comps[0].sgnd != image->comps[i + 1].sgnd)) {
+            fclose(fdest);
+            fprintf(stderr,
+                    "Unable to create a tga file with such J2K image charateristics.\n");
+            return 1;
+        }
+    }
+
+    width  = (int)image->comps[0].w;
+    height = (int)image->comps[0].h;
+
+    /* Mono with alpha, or RGB with alpha. */
+    write_alpha = (image->numcomps == 2) || (image->numcomps == 4);
+
+    /* Write TGA header  */
+    bpp = write_alpha ? 32 : 24;
+
+    if (!tga_writeheader(fdest, bpp, width, height, OPJ_TRUE)) {
+        goto fin;
+    }
+
+    alpha_channel = image->numcomps - 1;
+
+    scale = 255.0f / (float)((1 << image->comps[0].prec) - 1);
+
+    adjustR = (image->comps[0].sgnd ? 1 << (image->comps[0].prec - 1) : 0);
+    if (image->numcomps >= 3) {
+        adjustG = (image->comps[1].sgnd ? 1 << (image->comps[1].prec - 1) : 0);
+        adjustB = (image->comps[2].sgnd ? 1 << (image->comps[2].prec - 1) : 0);
+    }
+
+    for (y = 0; y < height; y++) {
+        unsigned int index = (unsigned int)(y * width);
+
+        for (x = 0; x < width; x++, index++) {
+            r = (float)(image->comps[0].data[index] + adjustR);
+
+            if (image->numcomps > 2) {
+                g = (float)(image->comps[1].data[index] + adjustG);
+                b = (float)(image->comps[2].data[index] + adjustB);
+            } else {
+                /* Greyscale ... */
+                g = r;
+                b = r;
+            }
+
+            /* TGA format writes BGR ... */
+            if (b > 255.) {
+                b = 255.;
+            } else if (b < 0.) {
+                b = 0.;
+            }
+            value = (unsigned char)(b * scale);
+            res = fwrite(&value, 1, 1, fdest);
+
+            if (res < 1) {
+                fprintf(stderr, "failed to write 1 byte for %s\n", outfile);
+                goto fin;
+            }
+            if (g > 255.) {
+                g = 255.;
+            } else if (g < 0.) {
+                g = 0.;
+            }
+            value = (unsigned char)(g * scale);
+            res = fwrite(&value, 1, 1, fdest);
+
+            if (res < 1) {
+                fprintf(stderr, "failed to write 1 byte for %s\n", outfile);
+                goto fin;
+            }
+            if (r > 255.) {
+                r = 255.;
+            } else if (r < 0.) {
+                r = 0.;
+            }
+            value = (unsigned char)(r * scale);
+            res = fwrite(&value, 1, 1, fdest);
+
+            if (res < 1) {
+                fprintf(stderr, "failed to write 1 byte for %s\n", outfile);
+                goto fin;
+            }
+
+            if (write_alpha) {
+                a = (float)(image->comps[alpha_channel].data[index]);
+                if (a > 255.) {
+                    a = 255.;
+                } else if (a < 0.) {
+                    a = 0.;
+                }
+                value = (unsigned char)(a * scale);
+                res = fwrite(&value, 1, 1, fdest);
+
+                if (res < 1) {
+                    fprintf(stderr, "failed to write 1 byte for %s\n", outfile);
+                    goto fin;
+                }
+            }
+        }
+    }
+    fails = 0;
+fin:
+    fclose(fdest);
+
+    return fails;
+}
+
+/* -->> -->> -->> -->>
+
+PGX IMAGE FORMAT
+
+<<-- <<-- <<-- <<-- */
+
+
+static unsigned char readuchar(FILE * f)
+{
+    unsigned char c1;
+    if (!fread(&c1, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    return c1;
+}
+
+static unsigned short readushort(FILE * f, int bigendian)
+{
+    unsigned char c1, c2;
+    if (!fread(&c1, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (!fread(&c2, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (bigendian) {
+        return (unsigned short)((c1 << 8) + c2);
+    } else {
+        return (unsigned short)((c2 << 8) + c1);
+    }
+}
+
+static unsigned int readuint(FILE * f, int bigendian)
+{
+    unsigned char c1, c2, c3, c4;
+    if (!fread(&c1, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (!fread(&c2, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (!fread(&c3, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (!fread(&c4, 1, 1, f)) {
+        fprintf(stderr,
+                "\nError: fread return a number of element different from the expected.\n");
+        return 0;
+    }
+    if (bigendian) {
+        return (unsigned int)(c1 << 24) + (unsigned int)(c2 << 16) + (unsigned int)(
+                   c3 << 8) + c4;
+    } else {
+        return (unsigned int)(c4 << 24) + (unsigned int)(c3 << 16) + (unsigned int)(
+                   c2 << 8) + c1;
+    }
+}
+
+opj_image_t* pgxtoimage(const char *filename, opj_cparameters_t *parameters)
+{
+    FILE *f = NULL;
+    int w, h, prec;
+    int i, numcomps, max;
+    OPJ_COLOR_SPACE color_space;
+    opj_image_cmptparm_t cmptparm;  /* maximum of 1 component  */
+    opj_image_t * image = NULL;
+    int adjustS, ushift, dshift, force8;
+
+    char endian1, endian2, sign;
+    char signtmp[32];
+
+    char temp[32];
+    int bigendian;
+    opj_image_comp_t *comp = NULL;
+
+    numcomps = 1;
+    color_space = OPJ_CLRSPC_GRAY;
+
+    memset(&cmptparm, 0, sizeof(opj_image_cmptparm_t));
+
+    max = 0;
+
+    f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s for reading !\n", filename);
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_SET);
+
+
+    //response
+    if (fscanf(f, "%s", temp) != 1) {
+        fprintf(stderr, "Failed to read %s !\n", filename);
+        goto fin;
+    }

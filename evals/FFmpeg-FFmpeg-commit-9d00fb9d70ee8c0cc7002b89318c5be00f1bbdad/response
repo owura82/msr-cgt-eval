@@ -1,0 +1,509 @@
+//c file
+/*
+ * MXF demuxer.
+ * Copyright (c) 2006 SmartJog S.A., Baptiste Coudurier <baptiste dot coudurier at smartjog dot com>
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+/*
+ * References
+ * SMPTE 336M KLV Data Encoding Protocol Using Key-Length-Value
+ * SMPTE 377M MXF File Format Specifications
+ * SMPTE 378M Operational Pattern 1a
+ * SMPTE 379M MXF Generic Container
+ * SMPTE 381M Mapping MPEG Streams into the MXF Generic Container
+ * SMPTE 382M Mapping AES3 and Broadcast Wave Audio into the MXF Generic Container
+ * SMPTE 383M Mapping DV-DIF Data to the MXF Generic Container
+ *
+ * Principle
+ * Search for Track numbers which will identify essence element KLV packets.
+ * Search for SourcePackage which define tracks which contains Track numbers.
+ * Material Package contains tracks with reference to SourcePackage tracks.
+ * Search for Descriptors (Picture, Sound) which contains codec info and parameters.
+ * Assign Descriptors to correct Tracks.
+ *
+ * Metadata reading functions read Local Tags, get InstanceUID(0x3C0A) then add MetaDataSet to MXFContext.
+ * Metadata parsing resolves Strong References to objects.
+ *
+ * Simple demuxer, only OP1A supported and some files might not work at all.
+ * Only tracks with associated descriptors will be decoded. "Highly Desirable" SMPTE 377M D.1
+ */
+
+#include <inttypes.h>
+
+#include "libavutil/aes.h"
+#include "libavutil/avassert.h"
+#include "libavutil/mathematics.h"
+#include "libavcodec/bytestream.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/timecode.h"
+#include "avformat.h"
+#include "internal.h"
+#include "mxf.h"
+
+typedef enum {
+    Header,
+    BodyPartition,
+    Footer
+} MXFPartitionType;
+
+typedef enum {
+    OP1a = 1,
+    OP1b,
+    OP1c,
+    OP2a,
+    OP2b,
+    OP2c,
+    OP3a,
+    OP3b,
+    OP3c,
+    OPAtom,
+    OPSONYOpt,  /* FATE sample, violates the spec in places */
+} MXFOP;
+
+typedef struct MXFPartition {
+    int closed;
+    int complete;
+    MXFPartitionType type;
+    uint64_t previous_partition;
+    int index_sid;
+    int body_sid;
+    int64_t this_partition;
+    int64_t essence_offset;         ///< absolute offset of essence
+    int64_t essence_length;
+    int32_t kag_size;
+    int64_t header_byte_count;
+    int64_t index_byte_count;
+    int pack_length;
+    int64_t pack_ofs;               ///< absolute offset of pack in file, including run-in
+} MXFPartition;
+
+typedef struct MXFCryptoContext {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID source_container_ul;
+} MXFCryptoContext;
+
+typedef struct MXFStructuralComponent {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID source_package_ul;
+    UID source_package_uid;
+    UID data_definition_ul;
+    int64_t duration;
+    int64_t start_position;
+    int source_track_id;
+} MXFStructuralComponent;
+
+typedef struct MXFSequence {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID data_definition_ul;
+    UID *structural_components_refs;
+    int structural_components_count;
+    int64_t duration;
+    uint8_t origin;
+} MXFSequence;
+
+typedef struct MXFTrack {
+    UID uid;
+    enum MXFMetadataSetType type;
+    int drop_frame;
+    int start_frame;
+    struct AVRational rate;
+    AVTimecode tc;
+} MXFTimecodeComponent;
+
+typedef struct {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID input_segment_ref;
+} MXFPulldownComponent;
+
+typedef struct {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID *structural_components_refs;
+    int structural_components_count;
+    int64_t duration;
+} MXFEssenceGroup;
+
+typedef struct {
+    UID uid;
+    enum MXFMetadataSetType type;
+    char *name;
+    char *value;
+} MXFTaggedValue;
+
+typedef struct {
+    UID uid;
+    enum MXFMetadataSetType type;
+    MXFSequence *sequence; /* mandatory, and only one */
+    UID sequence_ref;
+    int track_id;
+    char *name;
+    uint8_t track_number[4];
+    AVRational edit_rate;
+    int intra_only;
+    uint64_t sample_count;
+    int64_t original_duration; /* st->duration in SampleRate/EditRate units */
+} MXFTrack;
+
+typedef struct MXFDescriptor {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID essence_container_ul;
+    UID essence_codec_ul;
+    UID codec_ul;
+    AVRational sample_rate;
+    AVRational aspect_ratio;
+    int width;
+    int height; /* Field height, not frame height */
+    int frame_layout; /* See MXFFrameLayout enum */
+    int video_line_map[2];
+#define MXF_FIELD_DOMINANCE_DEFAULT 0
+#define MXF_FIELD_DOMINANCE_FF 1 /* coded first, displayed first */
+#define MXF_FIELD_DOMINANCE_FL 2 /* coded first, displayed last */
+    int field_dominance;
+    int channels;
+    int bits_per_sample;
+    int64_t duration; /* ContainerDuration optional property */
+    unsigned int component_depth;
+    unsigned int horiz_subsampling;
+    unsigned int vert_subsampling;
+    UID *sub_descriptors_refs;
+    int sub_descriptors_count;
+    int linked_track_id;
+    uint8_t *extradata;
+    int extradata_size;
+    enum AVPixelFormat pix_fmt;
+} MXFDescriptor;
+
+typedef struct MXFIndexTableSegment {
+    UID uid;
+    enum MXFMetadataSetType type;
+    int edit_unit_byte_count;
+    int index_sid;
+    int body_sid;
+    AVRational index_edit_rate;
+    uint64_t index_start_position;
+    uint64_t index_duration;
+    int8_t *temporal_offset_entries;
+    int *flag_entries;
+    uint64_t *stream_offset_entries;
+    int nb_index_entries;
+} MXFIndexTableSegment;
+
+typedef struct MXFPackage {
+    UID uid;
+    enum MXFMetadataSetType type;
+    UID package_uid;
+    UID package_ul;
+    UID *tracks_refs;
+    int tracks_count;
+    MXFDescriptor *descriptor; /* only one */
+    UID descriptor_ref;
+    char *name;
+    UID *comment_refs;
+    int comment_count;
+} MXFPackage;
+
+typedef struct MXFMetadataSet {
+    UID uid;
+    enum MXFMetadataSetType type;
+} MXFMetadataSet;
+
+/* decoded index table */
+typedef struct MXFIndexTable {
+    int index_sid;
+    int body_sid;
+    int nb_ptses;               /* number of PTSes or total duration of index */
+    int64_t first_dts;          /* DTS = EditUnit + first_dts */
+    int64_t *ptses;             /* maps EditUnit -> PTS */
+    int nb_segments;
+    MXFIndexTableSegment **segments;    /* sorted by IndexStartPosition */
+    AVIndexEntry *fake_index;   /* used for calling ff_index_search_timestamp() */
+    int8_t *offsets;            /* temporal offsets for display order to stored order conversion */
+} MXFIndexTable;
+
+typedef struct MXFContext {
+    MXFPartition *partitions;
+    unsigned partitions_count;
+    MXFOP op;
+    UID *packages_refs;
+    int packages_count;
+    MXFMetadataSet **metadata_sets;
+    int metadata_sets_count;
+    AVFormatContext *fc;
+    struct AVAES *aesc;
+    uint8_t *local_tags;
+    int local_tags_count;
+    uint64_t footer_partition;
+    KLVPacket current_klv_data;
+    int current_klv_index;
+    int run_in;
+    MXFPartition *current_partition;
+    int parsing_backward;
+    int64_t last_forward_tell;
+    int last_forward_partition;
+    int current_edit_unit;
+    int nb_index_tables;
+    MXFIndexTable *index_tables;
+    int edit_units_per_packet;      ///< how many edit units to read at a time (PCM, OPAtom)
+} MXFContext;
+
+enum MXFWrappingScheme {
+    Frame,
+    Clip,
+};
+
+/* NOTE: klv_offset is not set (-1) for local keys */
+typedef int MXFMetadataReadFunc(void *arg, AVIOContext *pb, int tag, int size, UID uid, int64_t klv_offset);
+
+typedef struct MXFMetadataReadTableEntry {
+    const UID key;
+    MXFMetadataReadFunc *read;
+    int ctx_size;
+    enum MXFMetadataSetType type;
+} MXFMetadataReadTableEntry;
+
+static int mxf_read_close(AVFormatContext *s);
+
+/* partial keys to match */
+static const uint8_t mxf_header_partition_pack_key[]       = { 0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x02 };
+static const uint8_t mxf_essence_element_key[]             = { 0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0d,0x01,0x03,0x01 };
+static const uint8_t mxf_avid_essence_element_key[]        = { 0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x01,0x0e,0x04,0x03,0x01 };
+static const uint8_t mxf_canopus_essence_element_key[]     = { 0x06,0x0e,0x2b,0x34,0x01,0x02,0x01,0x0a,0x0e,0x0f,0x03,0x01 };
+static const uint8_t mxf_system_item_key[]                 = { 0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x03,0x01,0x04 };
+static const uint8_t mxf_klv_key[]                         = { 0x06,0x0e,0x2b,0x34 };
+/* complete keys to match */
+static const uint8_t mxf_crypto_source_container_ul[]      = { 0x06,0x0e,0x2b,0x34,0x01,0x01,0x01,0x09,0x06,0x01,0x01,0x02,0x02,0x00,0x00,0x00 };
+static const uint8_t mxf_encrypted_triplet_key[]           = { 0x06,0x0e,0x2b,0x34,0x02,0x04,0x01,0x07,0x0d,0x01,0x03,0x01,0x02,0x7e,0x01,0x00 };
+static const uint8_t mxf_encrypted_essence_container[]     = { 0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x07,0x0d,0x01,0x03,0x01,0x02,0x0b,0x01,0x00 };
+static const uint8_t mxf_random_index_pack_key[]           = { 0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x11,0x01,0x00 };
+static const uint8_t mxf_sony_mpeg4_extradata[]            = { 0x06,0x0e,0x2b,0x34,0x04,0x01,0x01,0x01,0x0e,0x06,0x06,0x02,0x02,0x01,0x00,0x00 };
+static const uint8_t mxf_avid_project_name[]               = { 0xa5,0xfb,0x7b,0x25,0xf6,0x15,0x94,0xb9,0x62,0xfc,0x37,0x17,0x49,0x2d,0x42,0xbf };
+static const uint8_t mxf_jp2k_rsiz[]                       = { 0x06,0x0e,0x2b,0x34,0x02,0x05,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x02,0x01,0x00 };
+static const uint8_t mxf_indirect_value_utf16le[]          = { 0x4c,0x00,0x02,0x10,0x01,0x00,0x00,0x00,0x00,0x06,0x0e,0x2b,0x34,0x01,0x04,0x01,0x01 };
+static const uint8_t mxf_indirect_value_utf16be[]          = { 0x42,0x01,0x10,0x02,0x00,0x00,0x00,0x00,0x00,0x06,0x0e,0x2b,0x34,0x01,0x04,0x01,0x01 };
+
+#define IS_KLV_KEY(x, y) (!memcmp(x, y, sizeof(y)))
+
+static void mxf_free_metadataset(MXFMetadataSet **ctx, int freectx)
+{
+    MXFIndexTableSegment *seg;
+    switch ((*ctx)->type) {
+    case Descriptor:
+        av_freep(&((MXFDescriptor *)*ctx)->extradata);
+        break;
+    case MultipleDescriptor:
+        av_freep(&((MXFDescriptor *)*ctx)->sub_descriptors_refs);
+        break;
+    case Sequence:
+        av_freep(&((MXFSequence *)*ctx)->structural_components_refs);
+        break;
+    case EssenceGroup:
+        av_freep(&((MXFEssenceGroup *)*ctx)->structural_components_refs);
+        break;
+    case SourcePackage:
+    case MaterialPackage:
+        av_freep(&((MXFPackage *)*ctx)->tracks_refs);
+        av_freep(&((MXFPackage *)*ctx)->name);
+        av_freep(&((MXFPackage *)*ctx)->comment_refs);
+        break;
+    case TaggedValue:
+        av_freep(&((MXFTaggedValue *)*ctx)->name);
+        av_freep(&((MXFTaggedValue *)*ctx)->value);
+        break;
+    case Track:
+        av_freep(&((MXFTrack *)*ctx)->name);
+        break;
+    case IndexTableSegment:
+        seg = (MXFIndexTableSegment *)*ctx;
+        av_freep(&seg->temporal_offset_entries);
+        av_freep(&seg->flag_entries);
+        av_freep(&seg->stream_offset_entries);
+    default:
+        break;
+    }
+    if (freectx)
+    av_freep(ctx);
+}
+
+static int64_t klv_decode_ber_length(AVIOContext *pb)
+{
+    uint64_t size = avio_r8(pb);
+    if (size & 0x80) { /* long form */
+        int bytes_num = size & 0x7f;
+        /* SMPTE 379M 5.3.4 guarantee that bytes_num must not exceed 8 bytes */
+        if (bytes_num > 8)
+            return AVERROR_INVALIDDATA;
+        size = 0;
+        while (bytes_num--)
+            size = size << 8 | avio_r8(pb);
+    }
+    return size;
+}
+
+static int mxf_read_sync(AVIOContext *pb, const uint8_t *key, unsigned size)
+{
+    int i, b;
+    for (i = 0; i < size && !avio_feof(pb); i++) {
+        b = avio_r8(pb);
+        if (b == key[0])
+            i = 0;
+        else if (b != key[i])
+            i = -1;
+    }
+    return i == size;
+}
+
+static int klv_read_packet(KLVPacket *klv, AVIOContext *pb)
+{
+    if (!mxf_read_sync(pb, mxf_klv_key, 4))
+        return AVERROR_INVALIDDATA;
+    klv->offset = avio_tell(pb) - 4;
+    memcpy(klv->key, mxf_klv_key, 4);
+    avio_read(pb, klv->key + 4, 12);
+    klv->length = klv_decode_ber_length(pb);
+    return klv->length == -1 ? -1 : 0;
+}
+
+static int mxf_get_stream_index(AVFormatContext *s, KLVPacket *klv)
+{
+    int i;
+
+    for (i = 0; i < s->nb_streams; i++) {
+        MXFTrack *track = s->streams[i]->priv_data;
+        /* SMPTE 379M 7.3 */
+        if (track && !memcmp(klv->key + sizeof(mxf_essence_element_key), track->track_number, sizeof(track->track_number)))
+            return i;
+    }
+    /* return 0 if only one stream, for OP Atom files with 0 as track number */
+    return s->nb_streams == 1 ? 0 : -1;
+}
+
+/* XXX: use AVBitStreamFilter */
+static int mxf_get_d10_aes3_packet(AVIOContext *pb, AVStream *st, AVPacket *pkt, int64_t length)
+{
+    const uint8_t *buf_ptr, *end_ptr;
+    uint8_t *data_ptr;
+    int i;
+
+    if (length > 61444) /* worst case PAL 1920 samples 8 channels */
+        return AVERROR_INVALIDDATA;
+    length = av_get_packet(pb, pkt, length);
+    if (length < 0)
+        return length;
+    data_ptr = pkt->data;
+    end_ptr = pkt->data + length;
+    buf_ptr = pkt->data + 4; /* skip SMPTE 331M header */
+    for (; end_ptr - buf_ptr >= st->codecpar->channels * 4; ) {
+        for (i = 0; i < st->codecpar->channels; i++) {
+            uint32_t sample = bytestream_get_le32(&buf_ptr);
+            if (st->codecpar->bits_per_coded_sample == 24)
+                bytestream_put_le24(&data_ptr, (sample >> 4) & 0xffffff);
+            else
+                bytestream_put_le16(&data_ptr, (sample >> 12) & 0xffff);
+        }
+        buf_ptr += 32 - st->codecpar->channels*4; // always 8 channels stored SMPTE 331M
+    }
+    av_shrink_packet(pkt, data_ptr - pkt->data);
+    return 0;
+}
+
+static int mxf_decrypt_triplet(AVFormatContext *s, AVPacket *pkt, KLVPacket *klv)
+{
+    static const uint8_t checkv[16] = {0x43, 0x48, 0x55, 0x4b, 0x43, 0x48, 0x55, 0x4b, 0x43, 0x48, 0x55, 0x4b, 0x43, 0x48, 0x55, 0x4b};
+    MXFContext *mxf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int64_t end = avio_tell(pb) + klv->length;
+    int64_t size;
+    uint64_t orig_size;
+    uint64_t plaintext_size;
+    uint8_t ivec[16];
+    uint8_t tmpbuf[16];
+    int index;
+
+    if (!mxf->aesc && s->key && s->keylen == 16) {
+        mxf->aesc = av_aes_alloc();
+        if (!mxf->aesc)
+            return AVERROR(ENOMEM);
+        av_aes_init(mxf->aesc, s->key, 128, 1);
+    }
+    // crypto context
+    avio_skip(pb, klv_decode_ber_length(pb));
+    // plaintext offset
+    klv_decode_ber_length(pb);
+    plaintext_size = avio_rb64(pb);
+    // source klv key
+    klv_decode_ber_length(pb);
+    avio_read(pb, klv->key, 16);
+    if (!IS_KLV_KEY(klv, mxf_essence_element_key))
+        return AVERROR_INVALIDDATA;
+    index = mxf_get_stream_index(s, klv);
+    if (index < 0)
+        return AVERROR_INVALIDDATA;
+    // source size
+    klv_decode_ber_length(pb);
+    orig_size = avio_rb64(pb);
+    if (orig_size < plaintext_size)
+        return AVERROR_INVALIDDATA;
+    // enc. code
+    size = klv_decode_ber_length(pb);
+    if (size < 32 || size - 32 < orig_size)
+        return AVERROR_INVALIDDATA;
+    avio_read(pb, ivec, 16);
+    avio_read(pb, tmpbuf, 16);
+    if (mxf->aesc)
+        av_aes_crypt(mxf->aesc, tmpbuf, tmpbuf, 1, ivec, 1);
+    if (memcmp(tmpbuf, checkv, 16))
+        av_log(s, AV_LOG_ERROR, "probably incorrect decryption key\n");
+    size -= 32;
+    size = av_get_packet(pb, pkt, size);
+    if (size < 0)
+        return size;
+    else if (size < plaintext_size)
+        return AVERROR_INVALIDDATA;
+    size -= plaintext_size;
+    if (mxf->aesc)
+        av_aes_crypt(mxf->aesc, &pkt->data[plaintext_size],
+                     &pkt->data[plaintext_size], size >> 4, ivec, 1);
+    av_shrink_packet(pkt, orig_size);
+    pkt->stream_index = index;
+    avio_skip(pb, end - avio_tell(pb));
+    return 0;
+}
+
+static int mxf_read_primer_pack(void *arg, AVIOContext *pb, int tag, int size, UID uid, int64_t klv_offset)
+{
+    MXFContext *mxf = arg;
+    int item_num = avio_rb32(pb);
+    int item_len = avio_rb32(pb);
+
+    if (item_len != 18) {
+        avpriv_request_sample(pb, "Primer pack item length %d", item_len);
+        return AVERROR_PATCHWELCOME;
+    }
+
+    //response
+    if (item_num > 1) {
+        avpriv_request_sample(pb, "Primer pack item number %d", item_num);
+        return AVERROR_PATCHWELCOME;
+    }
