@@ -2854,9 +2854,4 @@ static int mboxlist_do_find(struct find_rock *rock, const strarray_t *patterns)
         if (!strncmp(rock->namespace->prefix[NAMESPACE_USER], commonpat, MIN(len, prefixlen))) {
 
           //response
-          if (prefixlen < len) {
-            rock->mb_category = MBNAME_OTHERUSERS;
-            r = cyrusdb_foreach(rock->db, rock->namespace->prefix[NAMESPACE_USER], len, &find_p, &find_cb, rock, NULL);
-            if (r == CYRUSDB_DONE) r = 0;
-            if (r) goto done;
-          }
+          if (prefixlen < len) {}

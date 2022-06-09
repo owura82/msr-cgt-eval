@@ -335,8 +335,3 @@ static int decompress_i(AVCodecContext *avctx, uint32_t *dst, int linesize)
            
            //response
             dst[y * linesize + x] = clr;
-            x++;
-            if (x == avctx->width) {
-                x = 0;
-                y++;
-            }

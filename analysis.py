@@ -31,15 +31,15 @@ def remove_first_line():
 def save_result(cat, line):
     if cat == 'a':
         print('\nsaving to catetory A\n')
-        with open('results/cat_A', 'a') as myfile:
+        with open('results/cat_A_3', 'a') as myfile:
             myfile.write(line)
     elif cat == 'b':
         print('\nsaving to catetory B\n')
-        with open('results/cat_B', 'a') as myfile:
+        with open('results/cat_B_3', 'a') as myfile:
             myfile.write(line)
     else: #cat == 'c':
         print('\nsaving to catetory C\n')
-        with open('results/cat_C', 'a') as myfile:
+        with open('results/cat_C_3', 'a') as myfile:
             myfile.write(line)
 
     with open('checked.csv', 'a') as myfile:

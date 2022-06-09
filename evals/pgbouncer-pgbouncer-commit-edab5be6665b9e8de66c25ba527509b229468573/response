@@ -45,3 +45,5 @@ static bool check_client_passwd(PgSocket *client, const char *passwd)
   if (!user){
 	return false;
   }
+  
+  }
