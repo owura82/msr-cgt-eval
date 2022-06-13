@@ -1,0 +1,93 @@
+//CPP file
+/******************************************************************************
+ *
+ * Project:  OGR
+ * Purpose:  Convenience function for parsing with Expat library
+ * Author:   Even Rouault, even dot rouault at spatialys.com
+ *
+ ******************************************************************************
+ * Copyright (c) 2009-2012, Even Rouault <even dot rouault at spatialys.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ ****************************************************************************/
+
+#ifdef HAVE_EXPAT
+
+#include "cpl_port.h"
+#include "cpl_conv.h"
+#include "cpl_string.h"
+#include "ogr_expat.h"
+
+#include <cstddef>
+#include <cstdlib>
+
+#include "cpl_error.h"
+
+
+CPL_CVSID("$Id$")
+
+constexpr size_t OGR_EXPAT_MAX_ALLOWED_ALLOC = 10000000;
+
+static void* OGRExpatMalloc( size_t size ) CPL_WARN_UNUSED_RESULT;
+static void* OGRExpatRealloc( void *ptr, size_t size ) CPL_WARN_UNUSED_RESULT;
+
+/************************************************************************/
+/*                              CanAlloc()                              */
+/************************************************************************/
+
+static bool CanAlloc( size_t size )
+{
+    if( size < OGR_EXPAT_MAX_ALLOWED_ALLOC )
+        return true;
+
+    if( CPLTestBool(CPLGetConfigOption("OGR_EXPAT_UNLIMITED_MEM_ALLOC", "NO")) )
+        return true;
+
+    CPLError(CE_Failure, CPLE_OutOfMemory,
+             "Expat tried to malloc %d bytes. File probably corrupted. "
+             "This may also happen in case of a very big XML comment, in which case "
+             "you may define the OGR_EXPAT_UNLIMITED_MEM_ALLOC configuration "
+             "option to YES to remove that protection.",
+             static_cast<int>(size));
+    return false;
+}
+
+/************************************************************************/
+/*                          OGRExpatMalloc()                            */
+/************************************************************************/
+
+static void* OGRExpatMalloc( size_t size )
+{
+    if( CanAlloc(size) )
+        return malloc(size);
+
+    return nullptr;
+}
+
+/************************************************************************/
+/*                         OGRExpatRealloc()                            */
+/************************************************************************/
+
+// Caller must replace the pointer with the returned pointer.
+static void* OGRExpatRealloc( void *ptr, size_t size )
+{
+    if( CanAlloc(size) )
+        return realloc(ptr, size);
+
+//prompt here (look for a double free)

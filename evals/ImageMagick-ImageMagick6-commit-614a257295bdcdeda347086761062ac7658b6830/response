@@ -1,0 +1,706 @@
+//C file
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%                         BBBB   L       OOO   BBBB                           %
+%                         B   B  L      O   O  B   B                          %
+%                         BBBB   L      O   O  BBBB                           %
+%                         B   B  L      O   O  B   B                          %
+%                         BBBB   LLLLL   OOO   BBBB                           %
+%                                                                             %
+%                                                                             %
+%                     MagickCore Binary Large OBjectS Methods                 %
+%                                                                             %
+%                              Software Design                                %
+%                                   Cristy                                    %
+%                                 July 1999                                   %
+%                                                                             %
+%                                                                             %
+%  Copyright 1999-2019 ImageMagick Studio LLC, a non-profit organization      %
+%  dedicated to making software imaging solutions freely available.           %
+%                                                                             %
+%  You may not use this file except in compliance with the License.  You may  %
+%  obtain a copy of the License at                                            %
+%                                                                             %
+%    https://imagemagick.org/script/license.php                               %
+%                                                                             %
+%  Unless required by applicable law or agreed to in writing, software        %
+%  distributed under the License is distributed on an "AS IS" BASIS,          %
+%  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   %
+%  See the License for the specific language governing permissions and        %
+%  limitations under the License.                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%
+%
+*/
+
+/*
+  Include declarations.
+*/
+#ifdef __VMS
+#include  <types.h>
+#include  <mman.h>
+#endif
+#include "magick/studio.h"
+#include "magick/blob.h"
+#include "magick/blob-private.h"
+#include "magick/cache.h"
+#include "magick/client.h"
+#include "magick/constitute.h"
+#include "magick/delegate.h"
+#include "magick/exception.h"
+#include "magick/exception-private.h"
+#include "magick/geometry.h"
+#include "magick/image-private.h"
+#include "magick/list.h"
+#include "magick/locale_.h"
+#include "magick/log.h"
+#include "magick/magick.h"
+#include "magick/memory_.h"
+#include "magick/nt-base-private.h"
+#include "magick/option.h"
+#include "magick/policy.h"
+#include "magick/resource_.h"
+#include "magick/semaphore.h"
+#include "magick/string_.h"
+#include "magick/string-private.h"
+#include "magick/timer-private.h"
+#include "magick/token.h"
+#include "magick/utility.h"
+#include "magick/utility-private.h"
+#if defined(MAGICKCORE_ZLIB_DELEGATE)
+#include "zlib.h"
+#endif
+#if defined(MAGICKCORE_BZLIB_DELEGATE)
+#include "bzlib.h"
+#endif
+
+/*
+  Define declarations.
+*/
+#define MagickMaxBlobExtent  65541
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+# define MAP_ANONYMOUS  MAP_ANON
+#endif
+#if !defined(MAP_FAILED)
+#define MAP_FAILED  ((void *) -1)
+#endif
+#if defined(__OS2__)
+#include <io.h>
+#define _O_BINARY O_BINARY
+#endif
+
+/*
+  Typedef declarations.
+*/
+typedef union FileInfo
+{
+  FILE
+    *file;
+
+#if defined(MAGICKCORE_ZLIB_DELEGATE)
+  gzFile
+    gzfile;
+#endif
+
+#if defined(MAGICKCORE_BZLIB_DELEGATE)
+  BZFILE
+    *bzfile;
+#endif
+} FileInfo;
+
+struct _BlobInfo
+{
+  size_t
+    length,
+    extent,
+    quantum;
+
+  BlobMode
+    mode;
+
+  MagickBooleanType
+    mapped,
+    eof;
+
+  int
+    error;
+
+  MagickOffsetType
+    offset;
+
+  MagickSizeType
+    size;
+
+  MagickBooleanType
+    exempt,
+    synchronize,
+    status,
+    temporary;
+
+  StreamType
+    type;
+
+  FileInfo
+    file_info;
+
+  struct stat
+    properties;
+
+  StreamHandler
+    stream;
+
+  unsigned char
+    *data;
+
+  MagickBooleanType
+    debug;
+
+  SemaphoreInfo
+    *semaphore;
+
+  ssize_t
+    reference_count;
+
+  size_t
+    signature;
+};
+
+/*
+  Forward declarations.
+*/
+static int
+  SyncBlob(Image *);
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   A t t a c h B l o b                                                       %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  AttachBlob() attaches a blob to the BlobInfo structure.
+%
+%  The format of the AttachBlob method is:
+%
+%      void AttachBlob(BlobInfo *blob_info,const void *blob,const size_t length)
+%
+%  A description of each parameter follows:
+%
+%    o blob_info: Specifies a pointer to a BlobInfo structure.
+%
+%    o blob: the address of a character stream in one of the image formats
+%      understood by ImageMagick.
+%
+%    o length: This size_t integer reflects the length in bytes of the blob.
+%
+*/
+MagickExport void AttachBlob(BlobInfo *blob_info,const void *blob,
+  const size_t length)
+{
+  assert(blob_info != (BlobInfo *) NULL);
+  if (blob_info->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"...");
+  blob_info->length=length;
+  blob_info->extent=length;
+  blob_info->quantum=(size_t) MagickMaxBlobExtent;
+  blob_info->offset=0;
+  blob_info->type=BlobStream;
+  blob_info->file_info.file=(FILE *) NULL;
+  blob_info->data=(unsigned char *) blob;
+  blob_info->mapped=MagickFalse;
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   B l o b T o F i l e                                                       %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  BlobToFile() writes a blob to a file.  It returns MagickFalse if an error
+%  occurs otherwise MagickTrue.
+%
+%  The format of the BlobToFile method is:
+%
+%       MagickBooleanType BlobToFile(char *filename,const void *blob,
+%         const size_t length,ExceptionInfo *exception)
+%
+%  A description of each parameter follows:
+%
+%    o filename: Write the blob to this file.
+%
+%    o blob: the address of a blob.
+%
+%    o length: This length in bytes of the blob.
+%
+%    o exception: return any errors or warnings in this structure.
+%
+*/
+MagickExport MagickBooleanType BlobToFile(char *filename,const void *blob,
+  const size_t length,ExceptionInfo *exception)
+{
+  int
+    file;
+
+  register size_t
+    i;
+
+  ssize_t
+    count;
+
+  assert(filename != (const char *) NULL);
+  (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",filename);
+  assert(blob != (const void *) NULL);
+  if (*filename == '\0')
+    file=AcquireUniqueFileResource(filename);
+  else
+    file=open_utf8(filename,O_RDWR | O_CREAT | O_EXCL | O_BINARY,S_MODE);
+  if (file == -1)
+    {
+      ThrowFileException(exception,BlobError,"UnableToWriteBlob",filename);
+      return(MagickFalse);
+    }
+  for (i=0; i < length; i+=count)
+  {
+    count=write(file,(const char *) blob+i,MagickMin(length-i,(size_t)
+      SSIZE_MAX));
+    if (count <= 0)
+      {
+        count=0;
+        if (errno != EINTR)
+          break;
+      }
+  }
+  file=close(file);
+  if ((file == -1) || (i < length))
+    {
+      ThrowFileException(exception,BlobError,"UnableToWriteBlob",filename);
+      return(MagickFalse);
+    }
+  return(MagickTrue);
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%   B l o b T o I m a g e                                                     %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  BlobToImage() implements direct to memory image formats.  It returns the
+%  blob as an image.
+%
+%  The format of the BlobToImage method is:
+%
+%      Image *BlobToImage(const ImageInfo *image_info,const void *blob,
+%        const size_t length,ExceptionInfo *exception)
+%
+%  A description of each parameter follows:
+%
+%    o image_info: the image info.
+%
+%    o blob: the address of a character stream in one of the image formats
+%      understood by ImageMagick.
+%
+%    o length: This size_t integer reflects the length in bytes of the blob.
+%
+%    o exception: return any errors or warnings in this structure.
+%
+*/
+MagickExport Image *BlobToImage(const ImageInfo *image_info,const void *blob,
+  const size_t length,ExceptionInfo *exception)
+{
+  const MagickInfo
+    *magick_info;
+
+  Image
+    *image;
+
+  ImageInfo
+    *blob_info,
+    *clone_info;
+
+  MagickBooleanType
+    status;
+
+  assert(image_info != (ImageInfo *) NULL);
+  assert(image_info->signature == MagickCoreSignature);
+  if (image_info->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",
+      image_info->filename);
+  assert(exception != (ExceptionInfo *) NULL);
+  if ((blob == (const void *) NULL) || (length == 0))
+    {
+      (void) ThrowMagickException(exception,GetMagickModule(),BlobError,
+        "ZeroLengthBlobNotPermitted","`%s'",image_info->filename);
+      return((Image *) NULL);
+    }
+  blob_info=CloneImageInfo(image_info);
+  blob_info->blob=(void *) blob;
+  blob_info->length=length;
+  if (*blob_info->magick == '\0')
+    (void) SetImageInfo(blob_info,0,exception);
+  magick_info=GetMagickInfo(blob_info->magick,exception);
+  if (magick_info == (const MagickInfo *) NULL)
+    {
+      (void) ThrowMagickException(exception,GetMagickModule(),
+        MissingDelegateError,"NoDecodeDelegateForThisImageFormat","`%s'",
+        blob_info->magick);
+      blob_info=DestroyImageInfo(blob_info);
+      return((Image *) NULL);
+    }
+  if (GetMagickBlobSupport(magick_info) != MagickFalse)
+    {
+      char
+        filename[MagickPathExtent];
+
+      /*
+        Native blob support for this image format.
+      */
+      (void) CopyMagickString(filename,blob_info->filename,MagickPathExtent);
+      (void) FormatLocaleString(blob_info->filename,MaxTextExtent,"%s:%s",
+        blob_info->magick,filename);
+      image=ReadImage(blob_info,exception);
+      if (image != (Image *) NULL)
+        (void) DetachBlob(image->blob);
+      blob_info=DestroyImageInfo(blob_info);
+      return(image);
+    }
+  /*
+    Write blob to a temporary file on disk.
+  */
+  blob_info->blob=(void *) NULL;
+  blob_info->length=0;
+  *blob_info->filename='\0';
+  status=BlobToFile(blob_info->filename,blob,length,exception);
+  if (status == MagickFalse)
+    {
+      (void) RelinquishUniqueFileResource(blob_info->filename);
+      blob_info=DestroyImageInfo(blob_info);
+      return((Image *) NULL);
+    }
+  clone_info=CloneImageInfo(blob_info);
+  (void) FormatLocaleString(clone_info->filename,MaxTextExtent,"%s:%s",
+    blob_info->magick,blob_info->filename);
+  image=ReadImage(clone_info,exception);
+  if (image != (Image *) NULL)
+    {
+      Image
+        *images;
+
+      /*
+        Restore original filenames and image format.
+      */
+      for (images=GetFirstImageInList(image); images != (Image *) NULL; )
+      {
+        (void) CopyMagickString(images->filename,image_info->filename,
+          MaxTextExtent);
+        (void) CopyMagickString(images->magick_filename,image_info->filename,
+          MaxTextExtent);
+        (void) CopyMagickString(images->magick,magick_info->name,MaxTextExtent);
+        images=GetNextImageInList(images);
+      }
+    }
+  clone_info=DestroyImageInfo(clone_info);
+  (void) RelinquishUniqueFileResource(blob_info->filename);
+  blob_info=DestroyImageInfo(blob_info);
+  return(image);
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   C l o n e B l o b I n f o                                                 %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  CloneBlobInfo() makes a duplicate of the given blob info structure, or if
+%  blob info is NULL, a new one.
+%
+%  The format of the CloneBlobInfo method is:
+%
+%      BlobInfo *CloneBlobInfo(const BlobInfo *blob_info)
+%
+%  A description of each parameter follows:
+%
+%    o blob_info: the blob info.
+%
+*/
+MagickExport BlobInfo *CloneBlobInfo(const BlobInfo *blob_info)
+{
+  BlobInfo
+    *clone_info;
+
+  SemaphoreInfo
+    *semaphore;
+
+  clone_info=(BlobInfo *) AcquireMagickMemory(sizeof(*clone_info));
+  GetBlobInfo(clone_info);
+  if (blob_info == (BlobInfo *) NULL)
+    return(clone_info);
+  semaphore=clone_info->semaphore;
+  (void) memcpy(clone_info,blob_info,sizeof(*clone_info));
+  if (blob_info->mapped != MagickFalse)
+    (void) AcquireMagickResource(MapResource,blob_info->length);
+  clone_info->semaphore=semaphore;
+  LockSemaphoreInfo(clone_info->semaphore);
+  clone_info->reference_count=1;
+  UnlockSemaphoreInfo(clone_info->semaphore);
+  return(clone_info);
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   C l o s e B l o b                                                         %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  CloseBlob() closes a stream associated with the image.
+%
+%  The format of the CloseBlob method is:
+%
+%      MagickBooleanType CloseBlob(Image *image)
+%
+%  A description of each parameter follows:
+%
+%    o image: the image.
+%
+*/
+MagickExport MagickBooleanType CloseBlob(Image *image)
+{
+  BlobInfo
+    *magick_restrict blob_info;
+
+  int
+    status;
+
+  /*
+    Close image file.
+  */
+  assert(image != (Image *) NULL);
+  assert(image->signature == MagickCoreSignature);
+  if (image->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
+  blob_info=image->blob;
+  if ((blob_info == (BlobInfo *) NULL) || (blob_info->type == UndefinedStream))
+    return(MagickTrue);
+  status=SyncBlob(image);
+  switch (blob_info->type)
+  {
+    case UndefinedStream:
+    case StandardStream:
+      break;
+    case FileStream:
+    case PipeStream:
+    {
+      if (blob_info->synchronize != MagickFalse)
+        status=fsync(fileno(blob_info->file_info.file));
+      status=ferror(blob_info->file_info.file);
+      break;
+    }
+    case ZipStream:
+    {
+#if defined(MAGICKCORE_ZLIB_DELEGATE)
+      (void) gzerror(blob_info->file_info.gzfile,&status);
+#endif
+      break;
+    }
+    case BZipStream:
+    {
+#if defined(MAGICKCORE_BZLIB_DELEGATE)
+      (void) BZ2_bzerror(blob_info->file_info.bzfile,&status);
+#endif
+      break;
+    }
+    case FifoStream:
+      break;
+    case BlobStream:
+    {
+      if (blob_info->file_info.file != (FILE *) NULL)
+        {
+          if (blob_info->synchronize != MagickFalse)
+            status=fsync(fileno(blob_info->file_info.file));
+          status=ferror(blob_info->file_info.file);
+        }
+      break;
+    }
+  }
+  blob_info->status=status < 0 ? MagickTrue : MagickFalse;
+  blob_info->size=GetBlobSize(image);
+  image->extent=blob_info->size;
+  blob_info->eof=MagickFalse;
+  blob_info->error=0;
+  if (blob_info->exempt != MagickFalse)
+    {
+      blob_info->type=UndefinedStream;
+      return(blob_info->status);
+    }
+  switch (blob_info->type)
+  {
+    case UndefinedStream:
+    case StandardStream:
+      break;
+    case FileStream:
+    {
+      if (fileno(blob_info->file_info.file) != -1)
+        status=fclose(blob_info->file_info.file);
+      break;
+    }
+    case PipeStream:
+    {
+#if defined(MAGICKCORE_HAVE_PCLOSE)
+      status=pclose(blob_info->file_info.file);
+#endif
+      break;
+    }
+    case ZipStream:
+    {
+#if defined(MAGICKCORE_ZLIB_DELEGATE)
+      status=gzclose(blob_info->file_info.gzfile);
+#endif
+      break;
+    }
+    case BZipStream:
+    {
+#if defined(MAGICKCORE_BZLIB_DELEGATE)
+      BZ2_bzclose(blob_info->file_info.bzfile);
+#endif
+      break;
+    }
+    case FifoStream:
+      break;
+    case BlobStream:
+    {
+      if (blob_info->file_info.file != (FILE *) NULL)
+        status=fclose(blob_info->file_info.file);
+      break;
+    }
+  }
+  (void) DetachBlob(blob_info);
+  blob_info->status=status < 0 ? MagickTrue : MagickFalse;
+  return(blob_info->status);
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   D e s t r o y B l o b                                                     %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  DestroyBlob() deallocates memory associated with a blob.
+%
+%  The format of the DestroyBlob method is:
+%
+%      void DestroyBlob(Image *image)
+%
+%  A description of each parameter follows:
+%
+%    o image: the image.
+%
+*/
+MagickExport void DestroyBlob(Image *image)
+{
+  BlobInfo
+    *magick_restrict blob_info;
+
+  MagickBooleanType
+    destroy;
+
+  assert(image != (Image *) NULL);
+  assert(image->signature == MagickCoreSignature);
+  if (image->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
+  assert(image->blob != (BlobInfo *) NULL);
+  assert(image->blob->signature == MagickCoreSignature);
+  blob_info=image->blob;
+  destroy=MagickFalse;
+  LockSemaphoreInfo(blob_info->semaphore);
+  blob_info->reference_count--;
+  assert(blob_info->reference_count >= 0);
+  if (blob_info->reference_count == 0)
+    destroy=MagickTrue;
+  UnlockSemaphoreInfo(blob_info->semaphore);
+  if (destroy == MagickFalse)
+    {
+      image->blob=(BlobInfo *) NULL;
+      return;
+    }
+  (void) CloseBlob(image);
+  if (blob_info->mapped != MagickFalse)
+    {
+      (void) UnmapBlob(blob_info->data,blob_info->length);
+      RelinquishMagickResource(MapResource,blob_info->length);
+    }
+  if (blob_info->semaphore != (SemaphoreInfo *) NULL)
+    DestroySemaphoreInfo(&blob_info->semaphore);
+  blob_info->signature=(~MagickCoreSignature);
+  image->blob=(BlobInfo *) RelinquishMagickMemory(blob_info);
+}
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
++   D e t a c h B l o b                                                       %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  DetachBlob() detaches a blob from the BlobInfo structure.
+%
+%  The format of the DetachBlob method is:
+%
+%      unsigned char *DetachBlob(BlobInfo *blob_info)
+%
+%  A description of each parameter follows:
+%
+%    o blob_info: Specifies a pointer to a BlobInfo structure.
+%
+*/
+MagickExport unsigned char *DetachBlob(BlobInfo *blob_info)
+{
+  unsigned char
+    *data;
+
+  assert(blob_info != (BlobInfo *) NULL);
+  if (blob_info->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"...");
+  if (blob_info->mapped != MagickFalse)
+    {
+      (void) UnmapBlob(blob_info->data,blob_info->length);
+      //BUGGY LOCATION - response
+      RelinquishMagickResource(MapResource,blob_info->length);
+    

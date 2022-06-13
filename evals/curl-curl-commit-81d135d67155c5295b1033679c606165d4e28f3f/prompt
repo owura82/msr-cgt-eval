@@ -1,0 +1,342 @@
+//c file
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) 1998 - 2018, Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.haxx.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ ***************************************************************************/
+
+#include "curl_setup.h"
+
+#ifdef HAVE_NETINET_IN_H
+#include <netinet/in.h>
+#endif
+#ifdef HAVE_NETDB_H
+#include <netdb.h>
+#endif
+#ifdef HAVE_ARPA_INET_H
+#include <arpa/inet.h>
+#endif
+#ifdef HAVE_NET_IF_H
+#include <net/if.h>
+#endif
+#ifdef HAVE_SYS_IOCTL_H
+#include <sys/ioctl.h>
+#endif
+
+#ifdef HAVE_SYS_PARAM_H
+#include <sys/param.h>
+#endif
+
+#ifdef __VMS
+#include <in.h>
+#include <inet.h>
+#endif
+
+#ifdef HAVE_SYS_UN_H
+#include <sys/un.h>
+#endif
+
+#ifndef HAVE_SOCKET
+#error "We can't compile without socket() support!"
+#endif
+
+#include <limits.h>
+
+#ifdef USE_LIBIDN2
+#include <idn2.h>
+
+#elif defined(USE_WIN32_IDN)
+/* prototype for curl_win32_idn_to_ascii() */
+bool curl_win32_idn_to_ascii(const char *in, char **out);
+#endif  /* USE_LIBIDN2 */
+
+#include "urldata.h"
+#include "netrc.h"
+
+#include "formdata.h"
+#include "mime.h"
+#include "vtls/vtls.h"
+#include "hostip.h"
+#include "transfer.h"
+#include "sendf.h"
+#include "progress.h"
+#include "cookie.h"
+#include "strcase.h"
+#include "strerror.h"
+#include "escape.h"
+#include "strtok.h"
+#include "share.h"
+#include "content_encoding.h"
+#include "http_digest.h"
+#include "http_negotiate.h"
+#include "select.h"
+#include "multiif.h"
+#include "easyif.h"
+#include "speedcheck.h"
+#include "warnless.h"
+#include "non-ascii.h"
+#include "inet_pton.h"
+#include "getinfo.h"
+#include "urlapi-int.h"
+
+/* And now for the protocols */
+#include "ftp.h"
+#include "dict.h"
+#include "telnet.h"
+#include "tftp.h"
+#include "http.h"
+#include "http2.h"
+#include "file.h"
+#include "curl_ldap.h"
+#include "ssh.h"
+#include "imap.h"
+#include "url.h"
+#include "connect.h"
+#include "inet_ntop.h"
+#include "http_ntlm.h"
+#include "curl_ntlm_wb.h"
+#include "socks.h"
+#include "curl_rtmp.h"
+#include "gopher.h"
+#include "http_proxy.h"
+#include "conncache.h"
+#include "multihandle.h"
+#include "pipeline.h"
+#include "dotdot.h"
+#include "strdup.h"
+#include "setopt.h"
+
+/* The last 3 #include files should be in this order */
+#include "curl_printf.h"
+#include "curl_memory.h"
+#include "memdebug.h"
+
+static void conn_free(struct connectdata *conn);
+static void free_fixed_hostname(struct hostname *host);
+static unsigned int get_protocol_family(unsigned int protocol);
+
+/* Some parts of the code (e.g. chunked encoding) assume this buffer has at
+ * more than just a few bytes to play with. Don't let it become too small or
+ * bad things will happen.
+ */
+#if READBUFFER_SIZE < READBUFFER_MIN
+# error READBUFFER_SIZE is too small
+#endif
+
+
+/*
+ * Protocol table.
+ */
+
+static const struct Curl_handler * const protocols[] = {
+
+#ifndef CURL_DISABLE_HTTP
+  &Curl_handler_http,
+#endif
+
+#if defined(USE_SSL) && !defined(CURL_DISABLE_HTTP)
+  &Curl_handler_https,
+#endif
+
+#ifndef CURL_DISABLE_FTP
+  &Curl_handler_ftp,
+#endif
+
+#if defined(USE_SSL) && !defined(CURL_DISABLE_FTP)
+  &Curl_handler_ftps,
+#endif
+
+#ifndef CURL_DISABLE_TELNET
+  &Curl_handler_telnet,
+#endif
+
+#ifndef CURL_DISABLE_DICT
+  &Curl_handler_dict,
+#endif
+
+#ifndef CURL_DISABLE_LDAP
+  &Curl_handler_ldap,
+#if !defined(CURL_DISABLE_LDAPS) && \
+    ((defined(USE_OPENLDAP) && defined(USE_SSL)) || \
+     (!defined(USE_OPENLDAP) && defined(HAVE_LDAP_SSL)))
+  &Curl_handler_ldaps,
+#endif
+#endif
+
+#ifndef CURL_DISABLE_FILE
+  &Curl_handler_file,
+#endif
+
+#ifndef CURL_DISABLE_TFTP
+  &Curl_handler_tftp,
+#endif
+
+#if defined(USE_LIBSSH2) || defined(USE_LIBSSH)
+  &Curl_handler_scp,
+#endif
+
+#if defined(USE_LIBSSH2) || defined(USE_LIBSSH)
+  &Curl_handler_sftp,
+#endif
+
+#ifndef CURL_DISABLE_IMAP
+  &Curl_handler_imap,
+#ifdef USE_SSL
+  &Curl_handler_imaps,
+#endif
+#endif
+
+#ifndef CURL_DISABLE_POP3
+  &Curl_handler_pop3,
+#ifdef USE_SSL
+  &Curl_handler_pop3s,
+#endif
+#endif
+
+#if !defined(CURL_DISABLE_SMB) && defined(USE_NTLM) && \
+   (CURL_SIZEOF_CURL_OFF_T > 4) && \
+   (!defined(USE_WINDOWS_SSPI) || defined(USE_WIN32_CRYPTO))
+  &Curl_handler_smb,
+#ifdef USE_SSL
+  &Curl_handler_smbs,
+#endif
+#endif
+
+#ifndef CURL_DISABLE_SMTP
+  &Curl_handler_smtp,
+#ifdef USE_SSL
+  &Curl_handler_smtps,
+#endif
+#endif
+
+#ifndef CURL_DISABLE_RTSP
+  &Curl_handler_rtsp,
+#endif
+
+#ifndef CURL_DISABLE_GOPHER
+  &Curl_handler_gopher,
+#endif
+
+#ifdef USE_LIBRTMP
+  &Curl_handler_rtmp,
+  &Curl_handler_rtmpt,
+  &Curl_handler_rtmpe,
+  &Curl_handler_rtmpte,
+  &Curl_handler_rtmps,
+  &Curl_handler_rtmpts,
+#endif
+
+  (struct Curl_handler *) NULL
+};
+
+/*
+ * Dummy handler for undefined protocol schemes.
+ */
+
+static const struct Curl_handler Curl_handler_dummy = {
+  "<no protocol>",                      /* scheme */
+  ZERO_NULL,                            /* setup_connection */
+  ZERO_NULL,                            /* do_it */
+  ZERO_NULL,                            /* done */
+  ZERO_NULL,                            /* do_more */
+  ZERO_NULL,                            /* connect_it */
+  ZERO_NULL,                            /* connecting */
+  ZERO_NULL,                            /* doing */
+  ZERO_NULL,                            /* proto_getsock */
+  ZERO_NULL,                            /* doing_getsock */
+  ZERO_NULL,                            /* domore_getsock */
+  ZERO_NULL,                            /* perform_getsock */
+  ZERO_NULL,                            /* disconnect */
+  ZERO_NULL,                            /* readwrite */
+  ZERO_NULL,                            /* connection_check */
+  0,                                    /* defport */
+  0,                                    /* protocol */
+  PROTOPT_NONE                          /* flags */
+};
+
+void Curl_freeset(struct Curl_easy *data)
+{
+  /* Free all dynamic strings stored in the data->set substructure. */
+  enum dupstring i;
+  for(i = (enum dupstring)0; i < STRING_LAST; i++) {
+    Curl_safefree(data->set.str[i]);
+  }
+
+  if(data->change.referer_alloc) {
+    Curl_safefree(data->change.referer);
+    data->change.referer_alloc = FALSE;
+  }
+  data->change.referer = NULL;
+  if(data->change.url_alloc) {
+    Curl_safefree(data->change.url);
+    data->change.url_alloc = FALSE;
+  }
+  data->change.url = NULL;
+
+  Curl_mime_cleanpart(&data->set.mimepost);
+}
+
+/* free the URL pieces */
+void Curl_up_free(struct Curl_easy *data)
+{
+  struct urlpieces *up = &data->state.up;
+  Curl_safefree(up->scheme);
+  Curl_safefree(up->hostname);
+  Curl_safefree(up->port);
+  Curl_safefree(up->user);
+  Curl_safefree(up->password);
+  Curl_safefree(up->options);
+  Curl_safefree(up->path);
+  Curl_safefree(up->query);
+  curl_url_cleanup(data->state.uh);
+  data->state.uh = NULL;
+}
+
+/*
+ * This is the internal function curl_easy_cleanup() calls. This should
+ * cleanup and free all resources associated with this sessionhandle.
+ *
+ * NOTE: if we ever add something that attempts to write to a socket or
+ * similar here, we must ignore SIGPIPE first. It is currently only done
+ * when curl_easy_perform() is invoked.
+ */
+
+CURLcode Curl_close(struct Curl_easy *data)
+{
+  struct Curl_multi *m;
+
+  if(!data)
+    return CURLE_OK;
+
+  Curl_expire_clear(data); /* shut off timers */
+
+  m = data->multi;
+  if(m)
+    /* This handle is still part of a multi handle, take care of this first
+       and detach this handle from there. */
+    curl_multi_remove_handle(data->multi, data);
+
+  if(data->multi_easy) {
+    /* when curl_easy_perform() is used, it creates its own multi handle to
+       use and this is the one */
+    curl_multi_cleanup(data->multi_easy);
+    //BUGGY LINE - null multi_easy to prevent use after free
+
+
+  }

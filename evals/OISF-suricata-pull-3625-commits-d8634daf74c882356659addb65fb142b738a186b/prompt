@@ -1,0 +1,1045 @@
+//C file
+/* Copyright (C) 2007-2017 Open Information Security Foundation
+ *
+ * You can copy, redistribute or modify this Program under the terms of
+ * the GNU General Public License version 2 as published by the Free
+ * Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * version 2 along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+ * 02110-1301, USA.
+ */
+
+/**
+ * \file
+ *
+ * \author Victor Julien <victor@inliniac.net>
+ *
+ * Basic detection engine
+ */
+
+#include "suricata-common.h"
+#include "suricata.h"
+#include "conf.h"
+
+#include "decode.h"
+#include "flow.h"
+#include "stream-tcp.h"
+#include "app-layer.h"
+#include "app-layer-parser.h"
+
+#include "detect.h"
+#include "detect-engine.h"
+#include "detect-engine-profile.h"
+
+#include "detect-engine-alert.h"
+#include "detect-engine-siggroup.h"
+#include "detect-engine-address.h"
+#include "detect-engine-proto.h"
+#include "detect-engine-port.h"
+#include "detect-engine-mpm.h"
+#include "detect-engine-iponly.h"
+#include "detect-engine-threshold.h"
+#include "detect-engine-prefilter.h"
+#include "detect-engine-state.h"
+#include "detect-engine-analyzer.h"
+
+#include "detect-engine-filedata.h"
+
+
+#include "detect-engine-payload.h"
+#include "detect-engine-event.h"
+#include "detect-engine-hcbd.h"
+#include "detect-engine-hsbd.h"
+
+#include "detect-filestore.h"
+#include "detect-flowvar.h"
+#include "detect-replace.h"
+
+#include "util-validate.h"
+#include "util-detect.h"
+
+typedef struct DetectRunScratchpad {
+    const AppProto alproto;
+    const uint8_t flow_flags; /* flow/state flags: STREAM_* */
+    const bool app_decoder_events;
+    const SigGroupHead *sgh;
+    SignatureMask pkt_mask;
+} DetectRunScratchpad;
+
+/* prototypes */
+static DetectRunScratchpad DetectRunSetup(const DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, Packet * const p, Flow * const pflow);
+static void DetectRunInspectIPOnly(ThreadVars *tv, const DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, Flow * const pflow, Packet * const p);
+static inline void DetectRunGetRuleGroup(const DetectEngineCtx *de_ctx,
+        Packet * const p, Flow * const pflow, DetectRunScratchpad *scratch);
+static inline void DetectRunPrefilterPkt(ThreadVars *tv,
+        DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx, Packet *p,
+        DetectRunScratchpad *scratch);
+static inline void DetectRulePacketRules(ThreadVars * const tv,
+        DetectEngineCtx * const de_ctx, DetectEngineThreadCtx * const det_ctx,
+        Packet * const p, Flow * const pflow, const DetectRunScratchpad *scratch);
+static void DetectRunTx(ThreadVars *tv, DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, Packet *p,
+        Flow *f, DetectRunScratchpad *scratch);
+static inline void DetectRunPostRules(ThreadVars *tv, DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, Packet * const p, Flow * const pflow,
+        DetectRunScratchpad *scratch);
+static void DetectRunCleanup(DetectEngineThreadCtx *det_ctx,
+        Packet *p, Flow * const pflow);
+
+/** \internal
+ */
+static void DetectRun(ThreadVars *th_v,
+        DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
+        Packet *p)
+{
+    SCEnter();
+    SCLogDebug("pcap_cnt %"PRIu64, p->pcap_cnt);
+
+    /* bail early if packet should not be inspected */
+    if (p->flags & PKT_NOPACKET_INSPECTION) {
+        /* nothing to do */
+        SCReturn;
+    }
+
+    /* Load the Packet's flow early, even though it might not be needed.
+     * Mark as a constant pointer, although the flow itself can change. */
+    Flow * const pflow = p->flow;
+
+    DetectRunScratchpad scratch = DetectRunSetup(de_ctx, det_ctx, p, pflow);
+
+    /* run the IPonly engine */
+    DetectRunInspectIPOnly(th_v, de_ctx, det_ctx, pflow, p);
+
+    /* get our rule group */
+    DetectRunGetRuleGroup(de_ctx, p, pflow, &scratch);
+    /* if we didn't get a sig group head, we
+     * have nothing to do.... */
+    if (scratch.sgh == NULL) {
+        SCLogDebug("no sgh for this packet, nothing to match against");
+        goto end;
+    }
+
+    /* run the prefilters for packets */
+    DetectRunPrefilterPkt(th_v, de_ctx, det_ctx, p, &scratch);
+
+    PACKET_PROFILING_DETECT_START(p, PROF_DETECT_RULES);
+    /* inspect the rules against the packet */
+    DetectRulePacketRules(th_v, de_ctx, det_ctx, p, pflow, &scratch);
+    PACKET_PROFILING_DETECT_END(p, PROF_DETECT_RULES);
+
+    /* run tx/state inspection */
+    if (pflow && pflow->alstate) {
+        PACKET_PROFILING_DETECT_START(p, PROF_DETECT_TX);
+        DetectRunTx(th_v, de_ctx, det_ctx, p, pflow, &scratch);
+        PACKET_PROFILING_DETECT_END(p, PROF_DETECT_TX);
+    }
+
+end:
+    DetectRunPostRules(th_v, de_ctx, det_ctx, p, pflow, &scratch);
+
+    DetectRunCleanup(det_ctx, p, pflow);
+    SCReturn;
+}
+
+static void DetectRunPostMatch(ThreadVars *tv,
+                               DetectEngineThreadCtx *det_ctx, Packet *p,
+                               const Signature *s)
+{
+    /* run the packet match functions */
+    const SigMatchData *smd = s->sm_arrays[DETECT_SM_LIST_POSTMATCH];
+    if (smd != NULL) {
+        KEYWORD_PROFILING_SET_LIST(det_ctx, DETECT_SM_LIST_POSTMATCH);
+
+        SCLogDebug("running match functions, sm %p", smd);
+
+        while (1) {
+            KEYWORD_PROFILING_START;
+            (void)sigmatch_table[smd->type].Match(tv, det_ctx, p, s, smd->ctx);
+            KEYWORD_PROFILING_END(det_ctx, smd->type, 1);
+            if (smd->is_last)
+                break;
+            smd++;
+        }
+    }
+
+    DetectReplaceExecute(p, det_ctx);
+
+    if (s->flags & SIG_FLAG_FILESTORE)
+        DetectFilestorePostMatch(tv, det_ctx, p, s);
+
+    return;
+}
+
+/**
+ *  \brief Get the SigGroupHead for a packet.
+ *
+ *  \param de_ctx detection engine context
+ *  \param p packet
+ *
+ *  \retval sgh the SigGroupHead or NULL if non applies to the packet
+ */
+const SigGroupHead *SigMatchSignaturesGetSgh(const DetectEngineCtx *de_ctx,
+        const Packet *p)
+{
+    SCEnter();
+
+    int f;
+    SigGroupHead *sgh = NULL;
+
+    /* if the packet proto is 0 (not set), we're inspecting it against
+     * the decoder events sgh we have. */
+    if (p->proto == 0 && p->events.cnt > 0) {
+        SCReturnPtr(de_ctx->decoder_event_sgh, "SigGroupHead");
+    } else if (p->proto == 0) {
+        if (!(PKT_IS_IPV4(p) || PKT_IS_IPV6(p))) {
+            /* not IP, so nothing to do */
+            SCReturnPtr(NULL, "SigGroupHead");
+        }
+    }
+
+    /* select the flow_gh */
+    if (p->flowflags & FLOW_PKT_TOCLIENT)
+        f = 0;
+    else
+        f = 1;
+
+    int proto = IP_GET_IPPROTO(p);
+    if (proto == IPPROTO_TCP) {
+        DetectPort *list = de_ctx->flow_gh[f].tcp;
+        SCLogDebug("tcp toserver %p, tcp toclient %p: going to use %p",
+                de_ctx->flow_gh[1].tcp, de_ctx->flow_gh[0].tcp, de_ctx->flow_gh[f].tcp);
+        uint16_t port = f ? p->dp : p->sp;
+        SCLogDebug("tcp port %u -> %u:%u", port, p->sp, p->dp);
+        DetectPort *sghport = DetectPortLookupGroup(list, port);
+        if (sghport != NULL)
+            sgh = sghport->sh;
+        SCLogDebug("TCP list %p, port %u, direction %s, sghport %p, sgh %p",
+                list, port, f ? "toserver" : "toclient", sghport, sgh);
+    } else if (proto == IPPROTO_UDP) {
+        DetectPort *list = de_ctx->flow_gh[f].udp;
+        uint16_t port = f ? p->dp : p->sp;
+        DetectPort *sghport = DetectPortLookupGroup(list, port);
+        if (sghport != NULL)
+            sgh = sghport->sh;
+        SCLogDebug("UDP list %p, port %u, direction %s, sghport %p, sgh %p",
+                list, port, f ? "toserver" : "toclient", sghport, sgh);
+    } else {
+        sgh = de_ctx->flow_gh[f].sgh[proto];
+    }
+
+    SCReturnPtr(sgh, "SigGroupHead");
+}
+
+static inline void DetectPrefilterMergeSort(DetectEngineCtx *de_ctx,
+                                            DetectEngineThreadCtx *det_ctx)
+{
+    SigIntId mpm, nonmpm;
+    det_ctx->match_array_cnt = 0;
+    SigIntId *mpm_ptr = det_ctx->pmq.rule_id_array;
+    SigIntId *nonmpm_ptr = det_ctx->non_pf_id_array;
+    uint32_t m_cnt = det_ctx->pmq.rule_id_array_cnt;
+    uint32_t n_cnt = det_ctx->non_pf_id_cnt;
+    SigIntId *final_ptr;
+    uint32_t final_cnt;
+    SigIntId id;
+    SigIntId previous_id = (SigIntId)-1;
+    Signature **sig_array = de_ctx->sig_array;
+    Signature **match_array = det_ctx->match_array;
+    Signature *s;
+
+    SCLogDebug("PMQ rule id array count %d", det_ctx->pmq.rule_id_array_cnt);
+
+    /* Load first values. */
+    if (likely(m_cnt)) {
+        mpm = *mpm_ptr;
+    } else {
+        /* mpm list is empty */
+        final_ptr = nonmpm_ptr;
+        final_cnt = n_cnt;
+        goto final;
+    }
+    if (likely(n_cnt)) {
+        nonmpm = *nonmpm_ptr;
+    } else {
+        /* non-mpm list is empty. */
+        final_ptr = mpm_ptr;
+        final_cnt = m_cnt;
+        goto final;
+    }
+    while (1) {
+        if (mpm < nonmpm) {
+            /* Take from mpm list */
+            id = mpm;
+
+            s = sig_array[id];
+            /* As the mpm list can contain duplicates, check for that here. */
+            if (likely(id != previous_id)) {
+                *match_array++ = s;
+                previous_id = id;
+            }
+            if (unlikely(--m_cnt == 0)) {
+                /* mpm list is now empty */
+                final_ptr = nonmpm_ptr;
+                final_cnt = n_cnt;
+                goto final;
+             }
+             mpm_ptr++;
+             mpm = *mpm_ptr;
+         } else if (mpm > nonmpm) {
+             id = nonmpm;
+
+             s = sig_array[id];
+             /* As the mpm list can contain duplicates, check for that here. */
+             if (likely(id != previous_id)) {
+                 *match_array++ = s;
+                 previous_id = id;
+             }
+             if (unlikely(--n_cnt == 0)) {
+                 final_ptr = mpm_ptr;
+                 final_cnt = m_cnt;
+                 goto final;
+             }
+             nonmpm_ptr++;
+             nonmpm = *nonmpm_ptr;
+
+        } else { /* implied mpm == nonmpm */
+            /* special case: if on both lists, it's a negated mpm pattern */
+
+            /* mpm list may have dups, so skip past them here */
+            while (--m_cnt != 0) {
+                mpm_ptr++;
+                mpm = *mpm_ptr;
+                if (mpm != nonmpm)
+                    break;
+            }
+            /* if mpm is done, update nonmpm_ptrs and jump to final */
+            if (unlikely(m_cnt == 0)) {
+                n_cnt--;
+
+                /* mpm list is now empty */
+                final_ptr = ++nonmpm_ptr;
+                final_cnt = n_cnt;
+                goto final;
+            }
+            /* otherwise, if nonmpm is done jump to final for mpm
+             * mpm ptrs alrady updated */
+            if (unlikely(--n_cnt == 0)) {
+                final_ptr = mpm_ptr;
+                final_cnt = m_cnt;
+                goto final;
+            }
+
+            /* not at end of the lists, update nonmpm. Mpm already
+             * updated in while loop above. */
+            nonmpm_ptr++;
+            nonmpm = *nonmpm_ptr;
+        }
+    }
+
+ final: /* Only one list remaining. Just walk that list. */
+
+    while (final_cnt-- > 0) {
+        id = *final_ptr++;
+        s = sig_array[id];
+
+        /* As the mpm list can contain duplicates, check for that here. */
+        if (likely(id != previous_id)) {
+            *match_array++ = s;
+            previous_id = id;
+        }
+    }
+
+    det_ctx->match_array_cnt = match_array - det_ctx->match_array;
+
+    BUG_ON((det_ctx->pmq.rule_id_array_cnt + det_ctx->non_pf_id_cnt) < det_ctx->match_array_cnt);
+}
+
+static inline void
+DetectPrefilterBuildNonPrefilterList(DetectEngineThreadCtx *det_ctx, SignatureMask mask, uint8_t alproto)
+{
+    uint32_t x = 0;
+    for (x = 0; x < det_ctx->non_pf_store_cnt; x++) {
+        /* only if the mask matches this rule can possibly match,
+         * so build the non_mpm array only for match candidates */
+        const SignatureMask rule_mask = det_ctx->non_pf_store_ptr[x].mask;
+        const uint8_t rule_alproto = det_ctx->non_pf_store_ptr[x].alproto;
+        if ((rule_mask & mask) == rule_mask && (rule_alproto == 0 || rule_alproto == alproto)) {
+            det_ctx->non_pf_id_array[det_ctx->non_pf_id_cnt++] = det_ctx->non_pf_store_ptr[x].id;
+        }
+    }
+}
+
+/** \internal
+ *  \brief select non-mpm list
+ *  Based on the packet properties, select the non-mpm list to use
+ *  \todo move non_pf_store* into scratchpad */
+static inline void
+DetectPrefilterSetNonPrefilterList(const Packet *p, DetectEngineThreadCtx *det_ctx, DetectRunScratchpad *scratch)
+{
+    if ((p->proto == IPPROTO_TCP) && (p->tcph != NULL) && (p->tcph->th_flags & TH_SYN)) {
+        det_ctx->non_pf_store_ptr = scratch->sgh->non_pf_syn_store_array;
+        det_ctx->non_pf_store_cnt = scratch->sgh->non_pf_syn_store_cnt;
+    } else {
+        det_ctx->non_pf_store_ptr = scratch->sgh->non_pf_other_store_array;
+        det_ctx->non_pf_store_cnt = scratch->sgh->non_pf_other_store_cnt;
+    }
+    SCLogDebug("sgh non_pf ptr %p cnt %u (syn %p/%u, other %p/%u)",
+            det_ctx->non_pf_store_ptr, det_ctx->non_pf_store_cnt,
+            scratch->sgh->non_pf_syn_store_array, scratch->sgh->non_pf_syn_store_cnt,
+            scratch->sgh->non_pf_other_store_array, scratch->sgh->non_pf_other_store_cnt);
+}
+
+/** \internal
+ *  \brief update flow's file tracking flags based on the detection engine
+ */
+static inline void
+DetectPostInspectFileFlagsUpdate(Flow *pflow, const SigGroupHead *sgh, uint8_t direction)
+{
+    /* see if this sgh requires us to consider file storing */
+    if (!FileForceFilestore() && (sgh == NULL ||
+                sgh->filestore_cnt == 0))
+    {
+        FileDisableStoring(pflow, direction);
+    }
+#ifdef HAVE_MAGIC
+    /* see if this sgh requires us to consider file magic */
+    if (!FileForceMagic() && (sgh == NULL ||
+                !(sgh->flags & SIG_GROUP_HEAD_HAVEFILEMAGIC)))
+    {
+        SCLogDebug("disabling magic for flow");
+        FileDisableMagic(pflow, direction);
+    }
+#endif
+    /* see if this sgh requires us to consider file md5 */
+    if (!FileForceMd5() && (sgh == NULL ||
+                !(sgh->flags & SIG_GROUP_HEAD_HAVEFILEMD5)))
+    {
+        SCLogDebug("disabling md5 for flow");
+        FileDisableMd5(pflow, direction);
+    }
+
+    /* see if this sgh requires us to consider file sha1 */
+    if (!FileForceSha1() && (sgh == NULL ||
+                !(sgh->flags & SIG_GROUP_HEAD_HAVEFILESHA1)))
+    {
+        SCLogDebug("disabling sha1 for flow");
+        FileDisableSha1(pflow, direction);
+    }
+
+    /* see if this sgh requires us to consider file sha256 */
+    if (!FileForceSha256() && (sgh == NULL ||
+                !(sgh->flags & SIG_GROUP_HEAD_HAVEFILESHA256)))
+    {
+        SCLogDebug("disabling sha256 for flow");
+        FileDisableSha256(pflow, direction);
+    }
+
+    /* see if this sgh requires us to consider filesize */
+    if (sgh == NULL || !(sgh->flags & SIG_GROUP_HEAD_HAVEFILESIZE))
+    {
+        SCLogDebug("disabling filesize for flow");
+        FileDisableFilesize(pflow, direction);
+    }
+}
+
+static inline void
+DetectRunPostGetFirstRuleGroup(const Packet *p, Flow *pflow, const SigGroupHead *sgh)
+{
+    if ((p->flowflags & FLOW_PKT_TOSERVER) && !(pflow->flags & FLOW_SGH_TOSERVER)) {
+        /* first time we see this toserver sgh, store it */
+        pflow->sgh_toserver = sgh;
+        pflow->flags |= FLOW_SGH_TOSERVER;
+
+        if (p->proto == IPPROTO_TCP && (sgh == NULL || !(sgh->flags & SIG_GROUP_HEAD_HAVERAWSTREAM))) {
+            if (pflow->protoctx != NULL) {
+                TcpSession *ssn = pflow->protoctx;
+                SCLogDebug("STREAMTCP_STREAM_FLAG_DISABLE_RAW ssn.client");
+                ssn->client.flags |= STREAMTCP_STREAM_FLAG_DISABLE_RAW;
+            }
+        }
+
+        DetectPostInspectFileFlagsUpdate(pflow,
+                pflow->sgh_toserver, STREAM_TOSERVER);
+
+    } else if ((p->flowflags & FLOW_PKT_TOCLIENT) && !(pflow->flags & FLOW_SGH_TOCLIENT)) {
+        pflow->sgh_toclient = sgh;
+        pflow->flags |= FLOW_SGH_TOCLIENT;
+
+        if (p->proto == IPPROTO_TCP && (sgh == NULL || !(sgh->flags & SIG_GROUP_HEAD_HAVERAWSTREAM))) {
+            if (pflow->protoctx != NULL) {
+                TcpSession *ssn = pflow->protoctx;
+                SCLogDebug("STREAMTCP_STREAM_FLAG_DISABLE_RAW ssn.server");
+                ssn->server.flags |= STREAMTCP_STREAM_FLAG_DISABLE_RAW;
+            }
+        }
+
+        DetectPostInspectFileFlagsUpdate(pflow,
+                pflow->sgh_toclient, STREAM_TOCLIENT);
+    }
+}
+
+static inline void DetectRunGetRuleGroup(
+    const DetectEngineCtx *de_ctx,
+    Packet * const p, Flow * const pflow,
+    DetectRunScratchpad *scratch)
+{
+    const SigGroupHead *sgh = NULL;
+
+    if (pflow) {
+        bool use_flow_sgh = false;
+        /* Get the stored sgh from the flow (if any). Make sure we're not using
+         * the sgh for icmp error packets part of the same stream. */
+        if (IP_GET_IPPROTO(p) == pflow->proto) { /* filter out icmp */
+            PACKET_PROFILING_DETECT_START(p, PROF_DETECT_GETSGH);
+            if ((p->flowflags & FLOW_PKT_TOSERVER) && (pflow->flags & FLOW_SGH_TOSERVER)) {
+                sgh = pflow->sgh_toserver;
+                SCLogDebug("sgh = pflow->sgh_toserver; => %p", sgh);
+                use_flow_sgh = true;
+            } else if ((p->flowflags & FLOW_PKT_TOCLIENT) && (pflow->flags & FLOW_SGH_TOCLIENT)) {
+                sgh = pflow->sgh_toclient;
+                SCLogDebug("sgh = pflow->sgh_toclient; => %p", sgh);
+                use_flow_sgh = true;
+            }
+            PACKET_PROFILING_DETECT_END(p, PROF_DETECT_GETSGH);
+        }
+
+        if (!(use_flow_sgh)) {
+            PACKET_PROFILING_DETECT_START(p, PROF_DETECT_GETSGH);
+            sgh = SigMatchSignaturesGetSgh(de_ctx, p);
+            PACKET_PROFILING_DETECT_END(p, PROF_DETECT_GETSGH);
+
+            /* HACK: prevent the wrong sgh (or NULL) from being stored in the
+             * flow's sgh pointers */
+            if (PKT_IS_ICMPV4(p) && ICMPV4_DEST_UNREACH_IS_VALID(p)) {
+                ; /* no-op */
+            } else {
+                /* store the found sgh (or NULL) in the flow to save us
+                 * from looking it up again for the next packet.
+                 * Also run other tasks */
+                DetectRunPostGetFirstRuleGroup(p, pflow, sgh);
+            }
+        }
+    } else { /* p->flags & PKT_HAS_FLOW */
+        /* no flow */
+
+        PACKET_PROFILING_DETECT_START(p, PROF_DETECT_GETSGH);
+        sgh = SigMatchSignaturesGetSgh(de_ctx, p);
+        PACKET_PROFILING_DETECT_END(p, PROF_DETECT_GETSGH);
+    }
+
+    scratch->sgh = sgh;
+}
+
+static void DetectRunInspectIPOnly(ThreadVars *tv, const DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx,
+        Flow * const pflow, Packet * const p)
+{
+    if (pflow) {
+        /* set the iponly stuff */
+        if (pflow->flags & FLOW_TOCLIENT_IPONLY_SET)
+            p->flowflags |= FLOW_PKT_TOCLIENT_IPONLY_SET;
+        if (pflow->flags & FLOW_TOSERVER_IPONLY_SET)
+            p->flowflags |= FLOW_PKT_TOSERVER_IPONLY_SET;
+
+        if (((p->flowflags & FLOW_PKT_TOSERVER) && !(p->flowflags & FLOW_PKT_TOSERVER_IPONLY_SET)) ||
+            ((p->flowflags & FLOW_PKT_TOCLIENT) && !(p->flowflags & FLOW_PKT_TOCLIENT_IPONLY_SET)))
+        {
+            SCLogDebug("testing against \"ip-only\" signatures");
+
+            PACKET_PROFILING_DETECT_START(p, PROF_DETECT_IPONLY);
+            IPOnlyMatchPacket(tv, de_ctx, det_ctx, &de_ctx->io_ctx, &det_ctx->io_ctx, p);
+            PACKET_PROFILING_DETECT_END(p, PROF_DETECT_IPONLY);
+
+            /* save in the flow that we scanned this direction... */
+            FlowSetIPOnlyFlag(pflow, p->flowflags & FLOW_PKT_TOSERVER ? 1 : 0);
+
+        } else if (((p->flowflags & FLOW_PKT_TOSERVER) &&
+                   (pflow->flags & FLOW_TOSERVER_IPONLY_SET)) ||
+                   ((p->flowflags & FLOW_PKT_TOCLIENT) &&
+                   (pflow->flags & FLOW_TOCLIENT_IPONLY_SET)))
+        {
+            /* If we have a drop from IP only module,
+             * we will drop the rest of the flow packets
+             * This will apply only to inline/IPS */
+            if (pflow->flags & FLOW_ACTION_DROP) {
+                PACKET_DROP(p);
+            }
+        }
+    } else { /* p->flags & PKT_HAS_FLOW */
+        /* no flow */
+
+        /* Even without flow we should match the packet src/dst */
+        PACKET_PROFILING_DETECT_START(p, PROF_DETECT_IPONLY);
+        IPOnlyMatchPacket(tv, de_ctx, det_ctx, &de_ctx->io_ctx,
+                          &det_ctx->io_ctx, p);
+        PACKET_PROFILING_DETECT_END(p, PROF_DETECT_IPONLY);
+    }
+}
+
+/* returns 0 if no match, 1 if match */
+static inline int DetectRunInspectRuleHeader(
+    const Packet *p,
+    const Flow *f,
+    const Signature *s,
+    const uint32_t sflags,
+    const uint8_t s_proto_flags)
+{
+    /* check if this signature has a requirement for flowvars of some type
+     * and if so, if we actually have any in the flow. If not, the sig
+     * can't match and we skip it. */
+    if ((p->flags & PKT_HAS_FLOW) && (sflags & SIG_FLAG_REQUIRE_FLOWVAR)) {
+        DEBUG_VALIDATE_BUG_ON(f == NULL);
+
+        int m  = f->flowvar ? 1 : 0;
+
+        /* no flowvars? skip this sig */
+        if (m == 0) {
+            SCLogDebug("skipping sig as the flow has no flowvars and sig "
+                    "has SIG_FLAG_REQUIRE_FLOWVAR flag set.");
+            return 0;
+        }
+    }
+
+    if ((s_proto_flags & DETECT_PROTO_IPV4) && !PKT_IS_IPV4(p)) {
+        SCLogDebug("ip version didn't match");
+        return 0;
+    }
+    if ((s_proto_flags & DETECT_PROTO_IPV6) && !PKT_IS_IPV6(p)) {
+        SCLogDebug("ip version didn't match");
+        return 0;
+    }
+
+    if (DetectProtoContainsProto(&s->proto, IP_GET_IPPROTO(p)) == 0) {
+        SCLogDebug("proto didn't match");
+        return 0;
+    }
+
+    /* check the source & dst port in the sig */
+    if (p->proto == IPPROTO_TCP || p->proto == IPPROTO_UDP || p->proto == IPPROTO_SCTP) {
+        if (!(sflags & SIG_FLAG_DP_ANY)) {
+            if (p->flags & PKT_IS_FRAGMENT)
+                return 0;
+            DetectPort *dport = DetectPortLookupGroup(s->dp,p->dp);
+            if (dport == NULL) {
+                SCLogDebug("dport didn't match.");
+                return 0;
+            }
+        }
+        if (!(sflags & SIG_FLAG_SP_ANY)) {
+            if (p->flags & PKT_IS_FRAGMENT)
+                return 0;
+            DetectPort *sport = DetectPortLookupGroup(s->sp,p->sp);
+            if (sport == NULL) {
+                SCLogDebug("sport didn't match.");
+                return 0;
+            }
+        }
+    } else if ((sflags & (SIG_FLAG_DP_ANY|SIG_FLAG_SP_ANY)) != (SIG_FLAG_DP_ANY|SIG_FLAG_SP_ANY)) {
+        SCLogDebug("port-less protocol and sig needs ports");
+        return 0;
+    }
+
+    /* check the destination address */
+    if (!(sflags & SIG_FLAG_DST_ANY)) {
+        if (PKT_IS_IPV4(p)) {
+            if (DetectAddressMatchIPv4(s->addr_dst_match4, s->addr_dst_match4_cnt, &p->dst) == 0)
+                return 0;
+        } else if (PKT_IS_IPV6(p)) {
+            if (DetectAddressMatchIPv6(s->addr_dst_match6, s->addr_dst_match6_cnt, &p->dst) == 0)
+                return 0;
+        }
+    }
+    /* check the source address */
+    if (!(sflags & SIG_FLAG_SRC_ANY)) {
+        if (PKT_IS_IPV4(p)) {
+            if (DetectAddressMatchIPv4(s->addr_src_match4, s->addr_src_match4_cnt, &p->src) == 0)
+                return 0;
+        } else if (PKT_IS_IPV6(p)) {
+            if (DetectAddressMatchIPv6(s->addr_src_match6, s->addr_src_match6_cnt, &p->src) == 0)
+                return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* returns 0 if no match, 1 if match */
+static inline int DetectRunInspectRulePacketMatches(
+    ThreadVars *tv,
+    DetectEngineThreadCtx *det_ctx,
+    Packet *p,
+    const Flow *f,
+    const Signature *s)
+{
+    /* run the packet match functions */
+    if (s->sm_arrays[DETECT_SM_LIST_MATCH] != NULL) {
+        KEYWORD_PROFILING_SET_LIST(det_ctx, DETECT_SM_LIST_MATCH);
+        SigMatchData *smd = s->sm_arrays[DETECT_SM_LIST_MATCH];
+
+        SCLogDebug("running match functions, sm %p", smd);
+        if (smd != NULL) {
+            while (1) {
+                KEYWORD_PROFILING_START;
+                if (sigmatch_table[smd->type].Match(tv, det_ctx, p, s, smd->ctx) <= 0) {
+                    KEYWORD_PROFILING_END(det_ctx, smd->type, 0);
+                    SCLogDebug("no match");
+                    return 0;
+                }
+                KEYWORD_PROFILING_END(det_ctx, smd->type, 1);
+                if (smd->is_last) {
+                    SCLogDebug("match and is_last");
+                    break;
+                }
+                smd++;
+            }
+        }
+    }
+    return 1;
+}
+
+/** \internal
+ *  \brief run packet/stream prefilter engines
+ */
+static inline void DetectRunPrefilterPkt(
+    ThreadVars *tv,
+    DetectEngineCtx *de_ctx,
+    DetectEngineThreadCtx *det_ctx,
+    Packet *p,
+    DetectRunScratchpad *scratch
+)
+{
+    DetectPrefilterSetNonPrefilterList(p, det_ctx, scratch);
+
+    /* create our prefilter mask */
+    PacketCreateMask(p, &scratch->pkt_mask, scratch->alproto, scratch->app_decoder_events);
+
+    /* build and prefilter non_pf list against the mask of the packet */
+    PACKET_PROFILING_DETECT_START(p, PROF_DETECT_NONMPMLIST);
+    det_ctx->non_pf_id_cnt = 0;
+    if (likely(det_ctx->non_pf_store_cnt > 0)) {
+        DetectPrefilterBuildNonPrefilterList(det_ctx, scratch->pkt_mask, scratch->alproto);
+    }
+    PACKET_PROFILING_DETECT_END(p, PROF_DETECT_NONMPMLIST);
+
+    /* run the prefilter engines */
+    Prefilter(det_ctx, scratch->sgh, p, scratch->flow_flags);
+    /* create match list if we have non-pf and/or pf */
+    if (det_ctx->non_pf_store_cnt || det_ctx->pmq.rule_id_array_cnt) {
+        PACKET_PROFILING_DETECT_START(p, PROF_DETECT_PF_SORT2);
+        DetectPrefilterMergeSort(de_ctx, det_ctx);
+        PACKET_PROFILING_DETECT_END(p, PROF_DETECT_PF_SORT2);
+    }
+
+#ifdef PROFILING
+    if (tv) {
+        StatsAddUI64(tv, det_ctx->counter_mpm_list,
+                             (uint64_t)det_ctx->pmq.rule_id_array_cnt);
+        StatsAddUI64(tv, det_ctx->counter_nonmpm_list,
+                             (uint64_t)det_ctx->non_pf_store_cnt);
+        /* non mpm sigs after mask prefilter */
+        StatsAddUI64(tv, det_ctx->counter_fnonmpm_list,
+                             (uint64_t)det_ctx->non_pf_id_cnt);
+    }
+#endif
+}
+
+static inline void DetectRulePacketRules(
+    ThreadVars * const tv,
+    DetectEngineCtx * const de_ctx,
+    DetectEngineThreadCtx * const det_ctx,
+    Packet * const p,
+    Flow * const pflow,
+    const DetectRunScratchpad *scratch
+)
+{
+    const Signature *s = NULL;
+    const Signature *next_s = NULL;
+
+    /* inspect the sigs against the packet */
+    /* Prefetch the next signature. */
+    SigIntId match_cnt = det_ctx->match_array_cnt;
+#ifdef PROFILING
+    if (tv) {
+        StatsAddUI64(tv, det_ctx->counter_match_list,
+                             (uint64_t)match_cnt);
+    }
+#endif
+    Signature **match_array = det_ctx->match_array;
+
+    SGH_PROFILING_RECORD(det_ctx, scratch->sgh);
+#ifdef PROFILING
+#ifdef HAVE_LIBJANSSON
+    if (match_cnt >= de_ctx->profile_match_logging_threshold)
+        RulesDumpMatchArray(det_ctx, scratch->sgh, p);
+#endif
+#endif
+
+    uint32_t sflags, next_sflags = 0;
+    if (match_cnt) {
+        next_s = *match_array++;
+        next_sflags = next_s->flags;
+    }
+    while (match_cnt--) {
+        RULE_PROFILING_START(p);
+        uint8_t alert_flags = 0;
+        bool state_alert = false;
+#ifdef PROFILING
+        bool smatch = false; /* signature match */
+#endif
+        s = next_s;
+        sflags = next_sflags;
+        if (match_cnt) {
+            next_s = *match_array++;
+            next_sflags = next_s->flags;
+        }
+        const uint8_t s_proto_flags = s->proto.flags;
+
+        SCLogDebug("inspecting signature id %"PRIu32"", s->id);
+
+        if (s->app_inspect != NULL) {
+            goto next; // handle sig in DetectRunTx
+        }
+
+        /* don't run mask check for stateful rules.
+         * There we depend on prefilter */
+        if ((s->mask & scratch->pkt_mask) != s->mask) {
+            SCLogDebug("mask mismatch %x & %x != %x", s->mask, scratch->pkt_mask, s->mask);
+            goto next;
+        }
+
+        if (unlikely(sflags & SIG_FLAG_DSIZE)) {
+            if (likely(p->payload_len < s->dsize_low || p->payload_len > s->dsize_high)) {
+                SCLogDebug("kicked out as p->payload_len %u, dsize low %u, hi %u",
+                        p->payload_len, s->dsize_low, s->dsize_high);
+                goto next;
+            }
+        }
+
+        /* if the sig has alproto and the session as well they should match */
+        if (likely(sflags & SIG_FLAG_APPLAYER)) {
+            if (s->alproto != ALPROTO_UNKNOWN && s->alproto != scratch->alproto) {
+                if (s->alproto == ALPROTO_DCERPC) {
+                    if (scratch->alproto != ALPROTO_SMB && scratch->alproto != ALPROTO_SMB2) {
+                        SCLogDebug("DCERPC sig, alproto not SMB or SMB2");
+                        goto next;
+                    }
+                } else {
+                    SCLogDebug("alproto mismatch");
+                    goto next;
+                }
+            }
+        }
+
+        if (DetectRunInspectRuleHeader(p, pflow, s, sflags, s_proto_flags) == 0) {
+            goto next;
+        }
+
+        /* Check the payload keywords. If we are a MPM sig and we've made
+         * to here, we've had at least one of the patterns match */
+        if (s->sm_arrays[DETECT_SM_LIST_PMATCH] != NULL) {
+            KEYWORD_PROFILING_SET_LIST(det_ctx, DETECT_SM_LIST_PMATCH);
+            /* if we have stream msgs, inspect against those first,
+             * but not for a "dsize" signature */
+            if (sflags & SIG_FLAG_REQUIRE_STREAM) {
+                int pmatch = 0;
+                if (p->flags & PKT_DETECT_HAS_STREAMDATA) {
+                    pmatch = DetectEngineInspectStreamPayload(de_ctx, det_ctx, s, pflow, p);
+                    if (pmatch) {
+                        det_ctx->flags |= DETECT_ENGINE_THREAD_CTX_STREAM_CONTENT_MATCH;
+                        /* Tell the engine that this reassembled stream can drop the
+                         * rest of the pkts with no further inspection */
+                        if (s->action & ACTION_DROP)
+                            alert_flags |= PACKET_ALERT_FLAG_DROP_FLOW;
+
+                        alert_flags |= PACKET_ALERT_FLAG_STREAM_MATCH;
+                    }
+                }
+                /* no match? then inspect packet payload */
+                if (pmatch == 0) {
+                    SCLogDebug("no match in stream, fall back to packet payload");
+
+                    /* skip if we don't have to inspect the packet and segment was
+                     * added to stream */
+                    if (!(sflags & SIG_FLAG_REQUIRE_PACKET) && (p->flags & PKT_STREAM_ADD)) {
+                        goto next;
+                    }
+
+                    if (DetectEngineInspectPacketPayload(de_ctx, det_ctx, s, pflow, p) != 1) {
+                        goto next;
+                    }
+                }
+            } else {
+                if (DetectEngineInspectPacketPayload(de_ctx, det_ctx, s, pflow, p) != 1) {
+                    goto next;
+                }
+            }
+        }
+
+        if (DetectRunInspectRulePacketMatches(tv, det_ctx, p, pflow, s) == 0)
+            goto next;
+
+#ifdef PROFILING
+        smatch = true;
+#endif
+        DetectRunPostMatch(tv, det_ctx, p, s);
+
+        if (!(sflags & SIG_FLAG_NOALERT)) {
+            /* stateful sigs call PacketAlertAppend from DeStateDetectStartDetection */
+            if (!state_alert)
+                PacketAlertAppend(det_ctx, s, p, 0, alert_flags);
+        } else {
+            /* apply actions even if not alerting */
+            DetectSignatureApplyActions(p, s, alert_flags);
+        }
+next:
+        DetectVarProcessList(det_ctx, pflow, p);
+        DetectReplaceFree(det_ctx);
+        RULE_PROFILING_END(det_ctx, s, smatch, p);
+
+        det_ctx->flags = 0;
+        continue;
+    }
+}
+
+static DetectRunScratchpad DetectRunSetup(
+    const DetectEngineCtx *de_ctx,
+    DetectEngineThreadCtx *det_ctx,
+    Packet * const p, Flow * const pflow)
+{
+    AppProto alproto = ALPROTO_UNKNOWN;
+    uint8_t flow_flags = 0; /* flow/state flags */
+    bool app_decoder_events = false;
+
+    PACKET_PROFILING_DETECT_START(p, PROF_DETECT_SETUP);
+
+#ifdef UNITTESTS
+    p->alerts.cnt = 0;
+#endif
+    det_ctx->ticker++;
+    det_ctx->filestore_cnt = 0;
+    det_ctx->base64_decoded_len = 0;
+    det_ctx->raw_stream_progress = 0;
+
+#ifdef DEBUG
+    if (p->flags & PKT_STREAM_ADD) {
+        det_ctx->pkt_stream_add_cnt++;
+    }
+#endif
+
+    /* grab the protocol state we will detect on */
+    if (p->flags & PKT_HAS_FLOW) {
+        DEBUG_VALIDATE_BUG_ON(pflow == NULL);
+
+        if (p->flowflags & FLOW_PKT_TOSERVER) {
+            flow_flags = STREAM_TOSERVER;
+            SCLogDebug("flag STREAM_TOSERVER set");
+        } else if (p->flowflags & FLOW_PKT_TOCLIENT) {
+            flow_flags = STREAM_TOCLIENT;
+            SCLogDebug("flag STREAM_TOCLIENT set");
+        }
+        SCLogDebug("p->flowflags 0x%02x", p->flowflags);
+
+        if (p->flags & PKT_STREAM_EOF) {
+            flow_flags |= STREAM_EOF;
+            SCLogDebug("STREAM_EOF set");
+        }
+
+        /* store tenant_id in the flow so that we can use it
+         * for creating pseudo packets */
+        if (p->tenant_id > 0 && pflow->tenant_id == 0) {
+            pflow->tenant_id = p->tenant_id;
+        }
+
+        /* live ruleswap check for flow updates */
+        if (pflow->de_ctx_version == 0) {
+            /* first time this flow is inspected, set id */
+            pflow->de_ctx_version = de_ctx->version;
+        } else if (pflow->de_ctx_version != de_ctx->version) {
+            /* first time we inspect flow with this de_ctx, reset */
+            pflow->flags &= ~FLOW_SGH_TOSERVER;
+            pflow->flags &= ~FLOW_SGH_TOCLIENT;
+            pflow->sgh_toserver = NULL;
+            pflow->sgh_toclient = NULL;
+
+            pflow->de_ctx_version = de_ctx->version;
+            GenericVarFree(pflow->flowvar);
+            pflow->flowvar = NULL;
+
+            DetectEngineStateResetTxs(pflow);
+        }
+
+        /* Retrieve the app layer state and protocol and the tcp reassembled
+         * stream chunks. */
+        if ((p->proto == IPPROTO_TCP && (p->flags & PKT_STREAM_EST)) ||
+                (p->proto == IPPROTO_UDP) ||
+                (p->proto == IPPROTO_SCTP && (p->flowflags & FLOW_PKT_ESTABLISHED)))
+        {
+            /* update flow flags with knowledge on disruptions */
+            flow_flags = FlowGetDisruptionFlags(pflow, flow_flags);
+            alproto = FlowGetAppProtocol(pflow);
+            if (p->proto == IPPROTO_TCP && pflow->protoctx &&
+                    StreamReassembleRawHasDataReady(pflow->protoctx, p)) {
+                p->flags |= PKT_DETECT_HAS_STREAMDATA;
+                flow_flags |= STREAM_FLUSH;
+            }
+            SCLogDebug("alproto %u", alproto);
+        } else {
+            SCLogDebug("packet doesn't have established flag set (proto %d)", p->proto);
+        }
+
+        app_decoder_events = AppLayerParserHasDecoderEvents(pflow->alparser);
+    }
+
+    DetectRunScratchpad pad = { alproto, flow_flags, app_decoder_events, NULL, 0 };
+    PACKET_PROFILING_DETECT_END(p, PROF_DETECT_SETUP);
+    return pad;
+}
+
+static inline void DetectRunPostRules(
+    ThreadVars *tv,
+    DetectEngineCtx *de_ctx,
+    DetectEngineThreadCtx *det_ctx,
+    Packet * const p,
+    Flow * const pflow,
+    DetectRunScratchpad *scratch)
+{
+    /* see if we need to increment the inspect_id and reset the de_state */
+    if (pflow && pflow->alstate && AppLayerParserProtocolSupportsTxs(p->proto, scratch->alproto)) {
+        PACKET_PROFILING_DETECT_START(p, PROF_DETECT_TX_UPDATE);
+        DeStateUpdateInspectTransactionId(pflow, scratch->flow_flags, (scratch->sgh == NULL));
+        PACKET_PROFILING_DETECT_END(p, PROF_DETECT_TX_UPDATE);
+    }
+
+    /* so now let's iterate the alerts and remove the ones after a pass rule
+     * matched (if any). This is done inside PacketAlertFinalize() */
+    /* PR: installed "tag" keywords are handled after the threshold inspection */
+
+    PACKET_PROFILING_DETECT_START(p, PROF_DETECT_ALERT);
+    PacketAlertFinalize(de_ctx, det_ctx, p);
+    if (p->alerts.cnt > 0) {
+        StatsAddUI64(tv, det_ctx->counter_alerts, (uint64_t)p->alerts.cnt);
+    }
+    PACKET_PROFILING_DETECT_END(p, PROF_DETECT_ALERT);
+}
+
+static void DetectRunCleanup(DetectEngineThreadCtx *det_ctx,
+        Packet *p, Flow * const pflow)
+{
+    PACKET_PROFILING_DETECT_START(p, PROF_DETECT_CLEANUP);
+    /* cleanup pkt specific part of the patternmatcher */
+    PacketPatternCleanup(det_ctx);
+
+    if (pflow != NULL) {
+        /* update inspected tracker for raw reassembly */
+
+        //BUGGY line, need another check on p->flags
+        if (p->proto == IPPROTO_TCP && pflow->protoctx != NULL &&

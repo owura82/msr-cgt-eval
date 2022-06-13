@@ -1,0 +1,727 @@
+//c File
+/*
+ * Microsoft Advanced Streaming Format demuxer
+ * Copyright (c) 2014 Alexandra Hájková
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include "libavutil/attributes.h"
+#include "libavutil/avstring.h"
+#include "libavutil/bswap.h"
+#include "libavutil/common.h"
+#include "libavutil/dict.h"
+#include "libavutil/internal.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/opt.h"
+#include "libavutil/time_internal.h"
+
+#include "avformat.h"
+#include "avio_internal.h"
+#include "avlanguage.h"
+#include "id3v2.h"
+#include "internal.h"
+#include "riff.h"
+#include "asf.h"
+#include "asfcrypt.h"
+
+#define ASF_BOOL                              0x2
+#define ASF_WORD                              0x5
+#define ASF_GUID                              0x6
+#define ASF_DWORD                             0x3
+#define ASF_QWORD                             0x4
+#define ASF_UNICODE                           0x0
+#define ASF_FLAG_BROADCAST                    0x1
+#define ASF_BYTE_ARRAY                        0x1
+#define ASF_TYPE_AUDIO                        0x2
+#define ASF_TYPE_VIDEO                        0x1
+#define ASF_STREAM_NUM                        0x7F
+#define ASF_MAX_STREAMS                       128
+#define BMP_HEADER_SIZE                       40
+#define ASF_NUM_OF_PAYLOADS                   0x3F
+#define ASF_ERROR_CORRECTION_LENGTH_TYPE      0x60
+#define ASF_PACKET_ERROR_CORRECTION_DATA_SIZE 0x2
+
+typedef struct GUIDParseTable {
+    const char *name;
+    ff_asf_guid guid;
+    int (*read_object)(AVFormatContext *, const struct GUIDParseTable *);
+    int is_subobject;
+} GUIDParseTable;
+
+typedef struct ASFPacket {
+    AVPacket avpkt;
+    int64_t dts;
+    uint32_t frame_num; // ASF payloads with the same number are parts of the same frame
+    int flags;
+    int data_size;
+    int duration;
+    int size_left;
+    uint8_t stream_index;
+} ASFPacket;
+
+typedef struct ASFStream {
+    uint8_t stream_index; // from packet header
+    int index;  // stream index in AVFormatContext, set in asf_read_stream_properties
+    int type;
+    int indexed; // added index entries from the Simple Index Object or not
+    int8_t span;   // for deinterleaving
+    uint16_t virtual_pkt_len;
+    uint16_t virtual_chunk_len;
+    int16_t lang_idx;
+    ASFPacket pkt;
+} ASFStream;
+
+typedef struct ASFStreamData{
+    char langs[32];
+    AVDictionary *asf_met; // for storing per-stream metadata
+    AVRational aspect_ratio;
+} ASFStreamData;
+
+typedef struct ASFContext {
+    int data_reached;
+    int is_simple_index; // is simple index present or not 1/0
+    int is_header;
+
+    uint64_t preroll;
+    uint64_t nb_packets; // ASF packets
+    uint32_t packet_size;
+    int64_t send_time;
+    int duration;
+
+    uint32_t b_flags;    // flags with broadcast flag
+    uint32_t prop_flags; // file properties object flags
+
+    uint64_t data_size; // data object size
+    uint64_t unknown_size; // size of the unknown object
+
+    int64_t offset; // offset of the current object
+
+    int64_t data_offset;
+    int64_t first_packet_offset; // packet offset
+    int64_t unknown_offset;   // for top level header objects or subobjects without specified behavior
+
+    // ASF file must not contain more than 128 streams according to the specification
+    ASFStream *asf_st[ASF_MAX_STREAMS];
+    ASFStreamData asf_sd[ASF_MAX_STREAMS];
+    int nb_streams;
+
+    int stream_index; // from packet header, for the subpayload case
+
+    // packet parameters
+    uint64_t sub_header_offset; // offset of subpayload header
+    int64_t sub_dts;
+    uint8_t dts_delta; // for subpayloads
+    uint32_t packet_size_internal; // packet size stored inside ASFPacket, can be 0
+    int64_t packet_offset; // offset of the current packet inside Data Object
+    uint32_t pad_len; // padding after payload
+    uint32_t rep_data_len;
+
+    // packet state
+    uint64_t sub_left;  // subpayloads left or not
+    unsigned int nb_sub; // number of subpayloads read so far from the current ASF packet
+    uint16_t mult_sub_len; // total length of subpayloads array inside multiple payload
+    uint64_t nb_mult_left; // multiple payloads left
+    int return_subpayload;
+    enum {
+        PARSE_PACKET_HEADER,
+        READ_SINGLE,
+        READ_MULTI,
+        READ_MULTI_SUB
+    } state;
+} ASFContext;
+
+static int detect_unknown_subobject(AVFormatContext *s, int64_t offset, int64_t size);
+static const GUIDParseTable *find_guid(ff_asf_guid guid);
+
+static int asf_probe(AVProbeData *pd)
+{
+    /* check file header */
+    if (!ff_guidcmp(pd->buf, &ff_asf_header))
+        return AVPROBE_SCORE_MAX/2;
+    else
+        return 0;
+}
+
+static void swap_guid(ff_asf_guid guid)
+{
+    FFSWAP(unsigned char, guid[0], guid[3]);
+    FFSWAP(unsigned char, guid[1], guid[2]);
+    FFSWAP(unsigned char, guid[4], guid[5]);
+    FFSWAP(unsigned char, guid[6], guid[7]);
+}
+
+static void align_position(AVIOContext *pb,  int64_t offset, uint64_t size)
+{
+    if (size < INT64_MAX - offset && avio_tell(pb) != offset + size)
+        avio_seek(pb, offset + size, SEEK_SET);
+}
+
+static int asf_read_unknown(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    uint64_t size   = avio_rl64(pb);
+    int ret;
+
+    if (size > INT64_MAX)
+        return AVERROR_INVALIDDATA;
+
+    if (asf->is_header)
+        asf->unknown_size = size;
+    asf->is_header = 0;
+    if (!g->is_subobject) {
+        if (!(ret = strcmp(g->name, "Header Extension")))
+            avio_skip(pb, 22); // skip reserved fields and Data Size
+        if ((ret = detect_unknown_subobject(s, asf->unknown_offset,
+                                            asf->unknown_size)) < 0)
+            return ret;
+    } else {
+        if (size < 24) {
+            av_log(s, AV_LOG_ERROR, "Too small size %"PRIu64" (< 24).\n", size);
+            return AVERROR_INVALIDDATA;
+        }
+        avio_skip(pb, size - 24);
+    }
+
+    return 0;
+}
+
+static int get_asf_string(AVIOContext *pb, int maxlen, char *buf, int buflen)
+{
+    char *q = buf;
+    int ret = 0;
+    if (buflen <= 0)
+        return AVERROR(EINVAL);
+    while (ret + 1 < maxlen) {
+        uint8_t tmp;
+        uint32_t ch;
+        GET_UTF16(ch, (ret += 2) <= maxlen ? avio_rl16(pb) : 0, break;);
+        PUT_UTF8(ch, tmp, if (q - buf < buflen - 1) *q++ = tmp;)
+    }
+    *q = 0;
+
+    return ret;
+}
+
+static int asf_read_marker(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    uint64_t size   = avio_rl64(pb);
+    int i, nb_markers, ret;
+    size_t len;
+    char name[1024];
+
+    avio_skip(pb, 8);
+    avio_skip(pb, 8); // skip reserved GUID
+    nb_markers = avio_rl32(pb);
+    avio_skip(pb, 2); // skip reserved field
+    len = avio_rl16(pb);
+    for (i = 0; i < len; i++)
+        avio_skip(pb, 1);
+
+    for (i = 0; i < nb_markers; i++) {
+        int64_t pts;
+
+        avio_skip(pb, 8);
+        pts = avio_rl64(pb);
+        pts -= asf->preroll * 10000;
+        avio_skip(pb, 2); // entry length
+        avio_skip(pb, 4); // send time
+        avio_skip(pb, 4); // flags
+        len = avio_rl32(pb);
+
+        if ((ret = avio_get_str16le(pb, len, name,
+                                    sizeof(name))) < len)
+            avio_skip(pb, len - ret);
+        avpriv_new_chapter(s, i, (AVRational) { 1, 10000000 }, pts,
+                           AV_NOPTS_VALUE, name);
+    }
+    align_position(pb, asf->offset, size);
+
+    return 0;
+}
+
+static int asf_read_metadata(AVFormatContext *s, const char *title, uint16_t len,
+                             unsigned char *ch, uint16_t buflen)
+{
+    AVIOContext *pb = s->pb;
+
+    avio_get_str16le(pb, len, ch, buflen);
+    if (ch[0]) {
+        if (av_dict_set(&s->metadata, title, ch, 0) < 0)
+            av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+    }
+
+    return 0;
+}
+
+static int asf_read_value(AVFormatContext *s, const uint8_t *name,
+                          uint16_t val_len, int type, AVDictionary **met)
+{
+    int ret;
+    uint8_t *value;
+    uint16_t buflen = 2 * val_len + 1;
+    AVIOContext *pb = s->pb;
+
+    value = av_malloc(buflen);
+    if (!value)
+        return AVERROR(ENOMEM);
+    if (type == ASF_UNICODE) {
+        // get_asf_string reads UTF-16 and converts it to UTF-8 which needs longer buffer
+        if ((ret = get_asf_string(pb, val_len, value, buflen)) < 0)
+            goto failed;
+        if (av_dict_set(met, name, value, 0) < 0)
+            av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+    } else {
+        char buf[256];
+        if (val_len > sizeof(buf)) {
+            ret = AVERROR_INVALIDDATA;
+            goto failed;
+        }
+        if ((ret = avio_read(pb, value, val_len)) < 0)
+            goto failed;
+        if (ret < 2 * val_len)
+            value[ret] = '\0';
+        else
+            value[2 * val_len - 1] = '\0';
+        snprintf(buf, sizeof(buf), "%s", value);
+        if (av_dict_set(met, name, buf, 0) < 0)
+            av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+    }
+    av_freep(&value);
+
+    return 0;
+
+failed:
+    av_freep(&value);
+    return ret;
+}
+static int asf_read_generic_value(AVIOContext *pb, int type, uint64_t *value)
+{
+
+    switch (type) {
+    case ASF_BOOL:
+        *value = avio_rl16(pb);
+        break;
+    case ASF_DWORD:
+        *value = avio_rl32(pb);
+        break;
+    case ASF_QWORD:
+        *value = avio_rl64(pb);
+        break;
+    case ASF_WORD:
+        *value = avio_rl16(pb);
+        break;
+    default:
+        return AVERROR_INVALIDDATA;
+    }
+
+    return 0;
+}
+
+static int asf_set_metadata(AVFormatContext *s, const uint8_t *name,
+                            int type, AVDictionary **met)
+{
+    AVIOContext *pb = s->pb;
+    uint64_t value;
+    char buf[32];
+    int ret;
+
+    ret = asf_read_generic_value(pb, type, &value);
+    if (ret < 0)
+        return ret;
+
+    snprintf(buf, sizeof(buf), "%"PRIu64, value);
+    if (av_dict_set(met, name, buf, 0) < 0)
+        av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+
+    return 0;
+}
+
+/* MSDN claims that this should be "compatible with the ID3 frame, APIC",
+ * but in reality this is only loosely similar */
+static int asf_read_picture(AVFormatContext *s, int len)
+{
+    ASFContext *asf       = s->priv_data;
+    AVPacket pkt          = { 0 };
+    const CodecMime *mime = ff_id3v2_mime_tags;
+    enum  AVCodecID id    = AV_CODEC_ID_NONE;
+    char mimetype[64];
+    uint8_t  *desc = NULL;
+    AVStream   *st = NULL;
+    int ret, type, picsize, desc_len;
+    ASFStream *asf_st;
+
+    /* type + picsize + mime + desc */
+    if (len < 1 + 4 + 2 + 2) {
+        av_log(s, AV_LOG_ERROR, "Invalid attached picture size: %d.\n", len);
+        return AVERROR_INVALIDDATA;
+    }
+
+    /* picture type */
+    type = avio_r8(s->pb);
+    len--;
+    if (type >= FF_ARRAY_ELEMS(ff_id3v2_picture_types) || type < 0) {
+        av_log(s, AV_LOG_WARNING, "Unknown attached picture type: %d.\n", type);
+        type = 0;
+    }
+
+    /* picture data size */
+    picsize = avio_rl32(s->pb);
+    len    -= 4;
+
+    /* picture MIME type */
+    len -= avio_get_str16le(s->pb, len, mimetype, sizeof(mimetype));
+    while (mime->id != AV_CODEC_ID_NONE) {
+        if (!strncmp(mime->str, mimetype, sizeof(mimetype))) {
+            id = mime->id;
+            break;
+        }
+        mime++;
+    }
+    if (id == AV_CODEC_ID_NONE) {
+        av_log(s, AV_LOG_ERROR, "Unknown attached picture mimetype: %s.\n",
+               mimetype);
+        return 0;
+    }
+
+    if (picsize >= len) {
+        av_log(s, AV_LOG_ERROR, "Invalid attached picture data size: %d >= %d.\n",
+               picsize, len);
+        return AVERROR_INVALIDDATA;
+    }
+
+    /* picture description */
+    desc_len = (len - picsize) * 2 + 1;
+    desc     = av_malloc(desc_len);
+    if (!desc)
+        return AVERROR(ENOMEM);
+    len -= avio_get_str16le(s->pb, len - picsize, desc, desc_len);
+
+    ret = av_get_packet(s->pb, &pkt, picsize);
+    if (ret < 0)
+        goto fail;
+
+    st  = avformat_new_stream(s, NULL);
+    if (!st) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    asf->asf_st[asf->nb_streams] = av_mallocz(sizeof(*asf_st));
+    asf_st = asf->asf_st[asf->nb_streams];
+    if (!asf_st) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    st->disposition              |= AV_DISPOSITION_ATTACHED_PIC;
+    st->codecpar->codec_type      = asf_st->type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id        = id;
+    st->attached_pic              = pkt;
+    st->attached_pic.stream_index = asf_st->index = st->index;
+    st->attached_pic.flags       |= AV_PKT_FLAG_KEY;
+
+    asf->nb_streams++;
+
+    if (*desc) {
+        if (av_dict_set(&st->metadata, "title", desc, AV_DICT_DONT_STRDUP_VAL) < 0)
+            av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+    } else
+        av_freep(&desc);
+
+    if (av_dict_set(&st->metadata, "comment", ff_id3v2_picture_types[type], 0) < 0)
+        av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+
+    return 0;
+
+fail:
+    av_freep(&desc);
+    av_packet_unref(&pkt);
+    return ret;
+}
+
+static void get_id3_tag(AVFormatContext *s, int len)
+{
+    ID3v2ExtraMeta *id3v2_extra_meta = NULL;
+
+    ff_id3v2_read(s, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta, len);
+    if (id3v2_extra_meta) {
+        ff_id3v2_parse_apic(s, &id3v2_extra_meta);
+        ff_id3v2_parse_chapters(s, &id3v2_extra_meta);
+    }
+    ff_id3v2_free_extra_meta(&id3v2_extra_meta);
+}
+
+static int process_metadata(AVFormatContext *s, const uint8_t *name, uint16_t name_len,
+                            uint16_t val_len, uint16_t type, AVDictionary **met)
+{
+    int ret;
+    ff_asf_guid guid;
+
+    if (val_len) {
+        switch (type) {
+        case ASF_UNICODE:
+            asf_read_value(s, name, val_len, type, met);
+            break;
+        case ASF_BYTE_ARRAY:
+            if (!strcmp(name, "WM/Picture")) // handle cover art
+                asf_read_picture(s, val_len);
+            else if (!strcmp(name, "ID3")) // handle ID3 tag
+                get_id3_tag(s, val_len);
+            else
+                asf_read_value(s, name, val_len, type, met);
+            break;
+        case ASF_GUID:
+            ff_get_guid(s->pb, &guid);
+            break;
+        default:
+            if ((ret = asf_set_metadata(s, name, type, met)) < 0)
+                return ret;
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int asf_read_ext_content(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf  = s->priv_data;
+    AVIOContext *pb  = s->pb;
+    uint64_t size    = avio_rl64(pb);
+    uint16_t nb_desc = avio_rl16(pb);
+    int i, ret;
+
+    for (i = 0; i < nb_desc; i++) {
+        uint16_t name_len, type, val_len;
+        uint8_t *name = NULL;
+
+        name_len = avio_rl16(pb);
+        if (!name_len)
+            return AVERROR_INVALIDDATA;
+        name = av_malloc(name_len);
+        if (!name)
+            return AVERROR(ENOMEM);
+        avio_get_str16le(pb, name_len, name,
+                         name_len);
+        type    = avio_rl16(pb);
+        // BOOL values are 16 bits long in the Metadata Object
+        // but 32 bits long in the Extended Content Description Object
+        if (type == ASF_BOOL)
+            type = ASF_DWORD;
+        val_len = avio_rl16(pb);
+
+        ret = process_metadata(s, name, name_len, val_len, type, &s->metadata);
+        av_freep(&name);
+        if (ret < 0)
+            return ret;
+    }
+
+    align_position(pb, asf->offset, size);
+    return 0;
+}
+
+static AVStream *find_stream(AVFormatContext *s, uint16_t st_num)
+{
+    AVStream *st = NULL;
+    ASFContext *asf = s->priv_data;
+    int i;
+
+    for (i = 0; i < asf->nb_streams; i++) {
+        if (asf->asf_st[i]->stream_index == st_num) {
+            st = s->streams[asf->asf_st[i]->index];
+            break;
+        }
+    }
+
+    return st;
+}
+
+static int asf_store_aspect_ratio(AVFormatContext *s, uint8_t st_num, uint8_t *name, int type)
+{
+    ASFContext *asf   = s->priv_data;
+    AVIOContext *pb   = s->pb;
+    uint64_t value = 0;
+    int ret;
+
+    ret = asf_read_generic_value(pb, type, &value);
+    if (ret < 0)
+        return ret;
+
+    if (st_num < ASF_MAX_STREAMS) {
+        if (!strcmp(name, "AspectRatioX"))
+            asf->asf_sd[st_num].aspect_ratio.num = value;
+        else
+            asf->asf_sd[st_num].aspect_ratio.den = value;
+    }
+    return 0;
+}
+
+static int asf_read_metadata_obj(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf   = s->priv_data;
+    AVIOContext *pb   = s->pb;
+    uint64_t size     = avio_rl64(pb);
+    uint16_t nb_recs  = avio_rl16(pb); // number of records in the Description Records list
+    int i, ret;
+
+    for (i = 0; i < nb_recs; i++) {
+        uint16_t name_len, buflen, type, val_len, st_num;
+        uint8_t *name = NULL;
+
+        avio_skip(pb, 2); // skip reserved field
+        st_num   = avio_rl16(pb);
+        name_len = avio_rl16(pb);
+        buflen   = 2 * name_len + 1;
+        if (!name_len)
+            break;
+        type     = avio_rl16(pb);
+        val_len  = avio_rl32(pb);
+        name     = av_malloc(buflen);
+        if (!name)
+            return AVERROR(ENOMEM);
+        avio_get_str16le(pb, name_len, name,
+                         buflen);
+        if (!strcmp(name, "AspectRatioX") || !strcmp(name, "AspectRatioY")) {
+            ret = asf_store_aspect_ratio(s, st_num, name, type);
+            if (ret < 0) {
+                av_freep(&name);
+                break;
+            }
+        } else {
+            if (st_num < ASF_MAX_STREAMS) {
+                if ((ret = process_metadata(s, name, name_len, val_len, type,
+                                            &asf->asf_sd[st_num].asf_met)) < 0) {
+                    av_freep(&name);
+                    break;
+                }
+            }
+        }
+        av_freep(&name);
+    }
+
+    align_position(pb, asf->offset, size);
+    return 0;
+}
+
+static int asf_read_content_desc(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int i;
+    static const char *const titles[] =
+    { "Title", "Author", "Copyright", "Description", "Rate" };
+    uint16_t len[5], buflen[5] = { 0 };
+    uint8_t *ch;
+    uint64_t size = avio_rl64(pb);
+
+    for (i = 0; i < 5; i++) {
+        len[i]  = avio_rl16(pb);
+        // utf8 string should be <= 2 * utf16 string, extra byte for the terminator
+        buflen[i]  = 2 * len[i] + 1;
+    }
+
+    for (i = 0; i < 5; i++) {
+        ch = av_malloc(buflen[i]);
+        if (!ch)
+            return(AVERROR(ENOMEM));
+        asf_read_metadata(s, titles[i], len[i], ch, buflen[i]);
+        av_freep(&ch);
+    }
+    align_position(pb, asf->offset, size);
+
+    return 0;
+}
+
+static int asf_read_properties(AVFormatContext *s, const GUIDParseTable *g)
+{
+    ASFContext *asf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    time_t creation_time;
+
+    avio_rl64(pb); // read object size
+    avio_skip(pb, 16); // skip File ID
+    avio_skip(pb, 8);  // skip File size
+    creation_time = avio_rl64(pb);
+    if (!(asf->b_flags & ASF_FLAG_BROADCAST)) {
+        struct tm tmbuf;
+        struct tm *tm;
+        char buf[64];
+
+        // creation date is in 100 ns units from 1 Jan 1601, conversion to s
+        creation_time /= 10000000;
+        // there are 11644473600 seconds between 1 Jan 1601 and 1 Jan 1970
+        creation_time -= 11644473600;
+        tm = gmtime_r(&creation_time, &tmbuf);
+        if (tm) {
+            if (!strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm))
+                buf[0] = '\0';
+        } else
+            buf[0] = '\0';
+        if (buf[0]) {
+            if (av_dict_set(&s->metadata, "creation_time", buf, 0) < 0)
+                av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
+        }
+    }
+    asf->nb_packets  = avio_rl64(pb);
+    asf->duration    = avio_rl64(pb) / 10000; // stream duration
+    avio_skip(pb, 8); // skip send duration
+    asf->preroll     = avio_rl64(pb);
+    asf->duration   -= asf->preroll;
+    asf->b_flags     = avio_rl32(pb);
+    avio_skip(pb, 4); // skip minimal packet size
+    asf->packet_size  = avio_rl32(pb);
+    avio_skip(pb, 4); // skip max_bitrate
+
+    return 0;
+}
+
+static int parse_video_info(AVIOContext *pb, AVStream *st)
+{
+    uint16_t size_asf; // ASF-specific Format Data size
+    uint32_t size_bmp; // BMP_HEADER-specific Format Data size
+    unsigned int tag;
+
+    st->codecpar->width  = avio_rl32(pb);
+    st->codecpar->height = avio_rl32(pb);
+    avio_skip(pb, 1); // skip reserved flags
+    size_asf = avio_rl16(pb);
+    tag = ff_get_bmp_header(pb, st, &size_bmp);
+    st->codecpar->codec_tag = tag;
+    st->codecpar->codec_id  = ff_codec_get_id(ff_codec_bmp_tags, tag);
+    size_bmp = FFMAX(size_asf, size_bmp);
+
+//response
+    if (size_bmp > BMP_HEADER_SIZE && size_bmp < BMP_HEADER_SIZE + 0x100) {
+        avio_skip(pb, size_bmp - BMP_HEADER_SIZE);
+    } else {
+        av_log(NULL, AV_LOG_ERROR, "BMP header size mismatch\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+
+
+
+
+
+
+
+
+
+    

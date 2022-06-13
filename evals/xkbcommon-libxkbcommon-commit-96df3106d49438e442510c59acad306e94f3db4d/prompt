@@ -1,0 +1,282 @@
+//c file
+/************************************************************
+ * Copyright (c) 1994 by Silicon Graphics Computer Systems, Inc.
+ *
+ * Permission to use, copy, modify, and distribute this
+ * software and its documentation for any purpose and without
+ * fee is hereby granted, provided that the above copyright
+ * notice appear in all copies and that both that copyright
+ * notice and this permission notice appear in supporting
+ * documentation, and that the name of Silicon Graphics not be
+ * used in advertising or publicity pertaining to distribution
+ * of the software without specific prior written permission.
+ * Silicon Graphics makes no representation about the suitability
+ * of this software for any purpose. It is provided "as is"
+ * without any express or implied warranty.
+ *
+ * SILICON GRAPHICS DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL SILICON
+ * GRAPHICS BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+ * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+ * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION  WITH
+ * THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ ********************************************************/
+
+/*
+ * Copyright © 2012 Ran Benita <ran234@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+#include "xkbcomp-priv.h"
+#include "text.h"
+#include "expr.h"
+#include "action.h"
+#include "vmod.h"
+#include "include.h"
+
+enum si_field {
+    SI_FIELD_VIRTUAL_MOD = (1 << 0),
+    SI_FIELD_ACTION = (1 << 1),
+    SI_FIELD_AUTO_REPEAT = (1 << 2),
+    SI_FIELD_LEVEL_ONE_ONLY = (1 << 3),
+};
+
+typedef struct {
+    enum si_field defined;
+    enum merge_mode merge;
+
+    struct xkb_sym_interpret interp;
+} SymInterpInfo;
+
+enum led_field {
+    LED_FIELD_MODS = (1 << 0),
+    LED_FIELD_GROUPS = (1 << 1),
+    LED_FIELD_CTRLS = (1 << 2),
+};
+
+typedef struct {
+    enum led_field defined;
+    enum merge_mode merge;
+
+    struct xkb_led led;
+} LedInfo;
+
+typedef struct {
+    char *name;
+    int errorCount;
+    SymInterpInfo default_interp;
+    darray(SymInterpInfo) interps;
+    LedInfo default_led;
+    LedInfo leds[XKB_MAX_LEDS];
+    unsigned int num_leds;
+    ActionsInfo *actions;
+    struct xkb_mod_set mods;
+
+    struct xkb_context *ctx;
+} CompatInfo;
+
+static const char *
+siText(SymInterpInfo *si, CompatInfo *info)
+{
+    char *buf = xkb_context_get_buffer(info->ctx, 128);
+
+    if (si == &info->default_interp)
+        return "default";
+
+    snprintf(buf, 128, "%s+%s(%s)",
+             KeysymText(info->ctx, si->interp.sym),
+             SIMatchText(si->interp.match),
+             ModMaskText(info->ctx, &info->mods, si->interp.mods));
+
+    return buf;
+}
+
+static inline bool
+ReportSINotArray(CompatInfo *info, SymInterpInfo *si, const char *field)
+{
+    return ReportNotArray(info->ctx, "symbol interpretation", field,
+                          siText(si, info));
+}
+
+static inline bool
+ReportSIBadType(CompatInfo *info, SymInterpInfo *si, const char *field,
+                const char *wanted)
+{
+    return ReportBadType(info->ctx, "symbol interpretation", field,
+                         siText(si, info), wanted);
+}
+
+static inline bool
+ReportLedBadType(CompatInfo *info, LedInfo *ledi, const char *field,
+                 const char *wanted)
+{
+    return ReportBadType(info->ctx, "indicator map", field,
+                         xkb_atom_text(info->ctx, ledi->led.name),
+                         wanted);
+}
+
+static inline bool
+ReportLedNotArray(CompatInfo *info, LedInfo *ledi, const char *field)
+{
+    return ReportNotArray(info->ctx, "indicator map", field,
+                          xkb_atom_text(info->ctx, ledi->led.name));
+}
+
+static void
+InitCompatInfo(CompatInfo *info, struct xkb_context *ctx,
+               ActionsInfo *actions, const struct xkb_mod_set *mods)
+{
+    memset(info, 0, sizeof(*info));
+    info->ctx = ctx;
+    info->actions = actions;
+    info->mods = *mods;
+    info->default_interp.merge = MERGE_OVERRIDE;
+    info->default_interp.interp.virtual_mod = XKB_MOD_INVALID;
+    info->default_led.merge = MERGE_OVERRIDE;
+}
+
+static void
+ClearCompatInfo(CompatInfo *info)
+{
+    free(info->name);
+    darray_free(info->interps);
+}
+
+static SymInterpInfo *
+FindMatchingInterp(CompatInfo *info, SymInterpInfo *new)
+{
+    SymInterpInfo *old;
+
+    darray_foreach(old, info->interps)
+        if (old->interp.sym == new->interp.sym &&
+            old->interp.mods == new->interp.mods &&
+            old->interp.match == new->interp.match)
+            return old;
+
+    return NULL;
+}
+
+static bool
+UseNewInterpField(enum si_field field, SymInterpInfo *old, SymInterpInfo *new,
+                  bool report, enum si_field *collide)
+{
+    if (!(old->defined & field))
+        return true;
+
+    if (new->defined & field) {
+        if (report)
+            *collide |= field;
+
+        if (new->merge != MERGE_AUGMENT)
+            return true;
+    }
+
+    return false;
+}
+
+static bool
+AddInterp(CompatInfo *info, SymInterpInfo *new, bool same_file)
+{
+    SymInterpInfo *old = FindMatchingInterp(info, new);
+    if (old) {
+        const int verbosity = xkb_context_get_log_verbosity(info->ctx);
+        const bool report = (same_file && verbosity > 0) || verbosity > 9;
+        enum si_field collide = 0;
+
+        if (new->merge == MERGE_REPLACE) {
+            if (report)
+                log_warn(info->ctx,
+                         "Multiple definitions for \"%s\"; "
+                         "Earlier interpretation ignored\n",
+                         siText(new, info));
+            *old = *new;
+            return true;
+        }
+
+        if (UseNewInterpField(SI_FIELD_VIRTUAL_MOD, old, new, report,
+                              &collide)) {
+            old->interp.virtual_mod = new->interp.virtual_mod;
+            old->defined |= SI_FIELD_VIRTUAL_MOD;
+        }
+        if (UseNewInterpField(SI_FIELD_ACTION, old, new, report,
+                              &collide)) {
+            old->interp.action = new->interp.action;
+            old->defined |= SI_FIELD_ACTION;
+        }
+        if (UseNewInterpField(SI_FIELD_AUTO_REPEAT, old, new, report,
+                              &collide)) {
+            old->interp.repeat = new->interp.repeat;
+            old->defined |= SI_FIELD_AUTO_REPEAT;
+        }
+        if (UseNewInterpField(SI_FIELD_LEVEL_ONE_ONLY, old, new, report,
+                              &collide)) {
+            old->interp.level_one_only = new->interp.level_one_only;
+            old->defined |= SI_FIELD_LEVEL_ONE_ONLY;
+        }
+
+        if (collide) {
+            log_warn(info->ctx,
+                     "Multiple interpretations of \"%s\"; "
+                     "Using %s definition for duplicate fields\n",
+                     siText(new, info),
+                     (new->merge != MERGE_AUGMENT ? "last" : "first"));
+        }
+
+        return true;
+    }
+
+    darray_append(info->interps, *new);
+    return true;
+}
+
+/***====================================================================***/
+
+static bool
+ResolveStateAndPredicate(ExprDef *expr, enum xkb_match_operation *pred_rtrn,
+                         xkb_mod_mask_t *mods_rtrn, CompatInfo *info)
+{
+    if (expr == NULL) {
+        *pred_rtrn = MATCH_ANY_OR_NONE;
+        *mods_rtrn = MOD_REAL_MASK_ALL;
+        return true;
+    }
+
+    *pred_rtrn = MATCH_EXACTLY;
+    if (expr->expr.op == EXPR_ACTION_DECL) {
+        const char *pred_txt = xkb_atom_text(info->ctx, expr->action.name);
+        //BUGGY LOCATION - check expression
+        if (!LookupString(symInterpretMatchMaskNames, pred_txt, pred_rtrn) ||
+
+
+
+
+
+
+
+
+
+
+
+
+        

@@ -1,0 +1,181 @@
+//c file
+/************************************************************
+ * Copyright (c) 1994 by Silicon Graphics Computer Systems, Inc.
+ *
+ * Permission to use, copy, modify, and distribute this
+ * software and its documentation for any purpose and without
+ * fee is hereby granted, provided that the above copyright
+ * notice appear in all copies and that both that copyright
+ * notice and this permission notice appear in supporting
+ * documentation, and that the name of Silicon Graphics not be
+ * used in advertising or publicity pertaining to distribution
+ * of the software without specific prior written permission.
+ * Silicon Graphics makes no representation about the suitability
+ * of this software for any purpose. It is provided "as is"
+ * without any express or implied warranty.
+ *
+ * SILICON GRAPHICS DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL SILICON
+ * GRAPHICS BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+ * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+ * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION  WITH
+ * THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ ********************************************************/
+
+#include "xkbcomp-priv.h"
+#include "text.h"
+#include "expr.h"
+
+typedef bool (*IdentLookupFunc)(struct xkb_context *ctx, const void *priv,
+                                xkb_atom_t field, enum expr_value_type type,
+                                unsigned int *val_rtrn);
+
+bool
+ExprResolveLhs(struct xkb_context *ctx, const ExprDef *expr,
+               const char **elem_rtrn, const char **field_rtrn,
+               ExprDef **index_rtrn)
+{
+    switch (expr->expr.op) {
+    case EXPR_IDENT:
+        *elem_rtrn = NULL;
+        *field_rtrn = xkb_atom_text(ctx, expr->ident.ident);
+        *index_rtrn = NULL;
+        return true;
+    case EXPR_FIELD_REF:
+        *elem_rtrn = xkb_atom_text(ctx, expr->field_ref.element);
+        *field_rtrn = xkb_atom_text(ctx, expr->field_ref.field);
+        *index_rtrn = NULL;
+        return true;
+    case EXPR_ARRAY_REF:
+        *elem_rtrn = xkb_atom_text(ctx, expr->array_ref.element);
+        *field_rtrn = xkb_atom_text(ctx, expr->array_ref.field);
+        *index_rtrn = expr->array_ref.entry;
+        return true;
+    default:
+        break;
+    }
+    log_wsgo(ctx, "Unexpected operator %d in ResolveLhs\n", expr->expr.op);
+    return false;
+}
+
+static bool
+SimpleLookup(struct xkb_context *ctx, const void *priv, xkb_atom_t field,
+             enum expr_value_type type, unsigned int *val_rtrn)
+{
+    const LookupEntry *entry;
+    const char *str;
+
+    if (!priv || field == XKB_ATOM_NONE || type != EXPR_TYPE_INT)
+        return false;
+
+    str = xkb_atom_text(ctx, field);
+    for (entry = priv; entry && entry->name; entry++) {
+        if (istreq(str, entry->name)) {
+            *val_rtrn = entry->value;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* Data passed in the *priv argument for LookupModMask. */
+typedef struct {
+    const struct xkb_mod_set *mods;
+    enum mod_type mod_type;
+} LookupModMaskPriv;
+
+static bool
+LookupModMask(struct xkb_context *ctx, const void *priv, xkb_atom_t field,
+              enum expr_value_type type, xkb_mod_mask_t *val_rtrn)
+{
+    const char *str;
+    xkb_mod_index_t ndx;
+    const LookupModMaskPriv *arg = priv;
+    const struct xkb_mod_set *mods = arg->mods;
+    enum mod_type mod_type = arg->mod_type;
+
+    if (type != EXPR_TYPE_INT)
+        return false;
+
+    str = xkb_atom_text(ctx, field);
+
+    if (istreq(str, "all")) {
+        *val_rtrn  = MOD_REAL_MASK_ALL;
+        return true;
+    }
+
+    if (istreq(str, "none")) {
+        *val_rtrn = 0;
+        return true;
+    }
+
+    ndx = XkbModNameToIndex(mods, field, mod_type);
+    if (ndx == XKB_MOD_INVALID)
+        return false;
+
+    *val_rtrn = (1u << ndx);
+    return true;
+}
+
+bool
+ExprResolveBoolean(struct xkb_context *ctx, const ExprDef *expr,
+                   bool *set_rtrn)
+{
+    bool ok = false;
+    const char *ident;
+
+    switch (expr->expr.op) {
+    case EXPR_VALUE:
+        if (expr->expr.value_type != EXPR_TYPE_BOOLEAN) {
+            log_err(ctx,
+                    "Found constant of type %s where boolean was expected\n",
+                    expr_value_type_to_string(expr->expr.value_type));
+            return false;
+        }
+        *set_rtrn = expr->boolean.set;
+        return true;
+
+    case EXPR_IDENT:
+        ident = xkb_atom_text(ctx, expr->ident.ident);
+        if (ident) {
+            if (istreq(ident, "true") ||
+                istreq(ident, "yes") ||
+                istreq(ident, "on")) {
+                *set_rtrn = true;
+                return true;
+            }
+            else if (istreq(ident, "false") ||
+                     istreq(ident, "no") ||
+                     istreq(ident, "off")) {
+                *set_rtrn = false;
+                return true;
+            }
+        }
+        log_err(ctx, "Identifier \"%s\" of type boolean is unknown\n", ident);
+        return false;
+
+    case EXPR_FIELD_REF:
+        log_err(ctx, "Default \"%s.%s\" of type boolean is unknown\n",
+                xkb_atom_text(ctx, expr->field_ref.element),
+                xkb_atom_text(ctx, expr->field_ref.field));
+        return false;
+
+    case EXPR_INVERT:
+    case EXPR_NOT:
+      
+      //response
+        ok = ExprResolveBoolean(ctx, expr->expr.left, set_rtrn);
+
+
+
+
+
+
+
+
+
+        

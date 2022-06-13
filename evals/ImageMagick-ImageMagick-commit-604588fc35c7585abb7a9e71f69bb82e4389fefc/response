@@ -1,0 +1,220 @@
+//c file
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%       TTTTT  H   H  RRRR   EEEEE  SSSSS  H   H   OOO   L      DDDD          %
+%         T    H   H  R   R  E      SS     H   H  O   O  L      D   D         %
+%         T    HHHHH  RRRR   EEE     SSS   HHHHH  O   O  L      D   D         %
+%         T    H   H  R R    E         SS  H   H  O   O  L      D   D         %
+%         T    H   H  R  R   EEEEE  SSSSS  H   H   OOO   LLLLL  DDDD          %
+%                                                                             %
+%                                                                             %
+%                      MagickCore Image Threshold Methods                     %
+%                                                                             %
+%                               Software Design                               %
+%                                    Cristy                                   %
+%                                 October 1996                                %
+%                                                                             %
+%                                                                             %
+%  Copyright 1999-2019 ImageMagick Studio LLC, a non-profit organization      %
+%  dedicated to making software imaging solutions freely available.           %
+%                                                                             %
+%  You may not use this file except in compliance with the License.  You may  %
+%  obtain a copy of the License at                                            %
+%                                                                             %
+%    https://imagemagick.org/script/license.php                               %
+%                                                                             %
+%  Unless required by applicable law or agreed to in writing, software        %
+%  distributed under the License is distributed on an "AS IS" BASIS,          %
+%  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   %
+%  See the License for the specific language governing permissions and        %
+%  limitations under the License.                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%
+%
+*/
+
+/*
+  Include declarations.
+*/
+#include "MagickCore/studio.h"
+#include "MagickCore/property.h"
+#include "MagickCore/blob.h"
+#include "MagickCore/cache-view.h"
+#include "MagickCore/color.h"
+#include "MagickCore/color-private.h"
+#include "MagickCore/colormap.h"
+#include "MagickCore/colorspace.h"
+#include "MagickCore/colorspace-private.h"
+#include "MagickCore/configure.h"
+#include "MagickCore/constitute.h"
+#include "MagickCore/decorate.h"
+#include "MagickCore/draw.h"
+#include "MagickCore/enhance.h"
+#include "MagickCore/exception.h"
+#include "MagickCore/exception-private.h"
+#include "MagickCore/effect.h"
+#include "MagickCore/fx.h"
+#include "MagickCore/gem.h"
+#include "MagickCore/geometry.h"
+#include "MagickCore/image-private.h"
+#include "MagickCore/list.h"
+#include "MagickCore/log.h"
+#include "MagickCore/memory_.h"
+#include "MagickCore/memory-private.h"
+#include "MagickCore/monitor.h"
+#include "MagickCore/monitor-private.h"
+#include "MagickCore/montage.h"
+#include "MagickCore/option.h"
+#include "MagickCore/pixel-accessor.h"
+#include "MagickCore/pixel-private.h"
+#include "MagickCore/quantize.h"
+#include "MagickCore/quantum.h"
+#include "MagickCore/quantum-private.h"
+#include "MagickCore/random_.h"
+#include "MagickCore/random-private.h"
+#include "MagickCore/resize.h"
+#include "MagickCore/resource_.h"
+#include "MagickCore/segment.h"
+#include "MagickCore/shear.h"
+#include "MagickCore/signature-private.h"
+#include "MagickCore/string_.h"
+#include "MagickCore/string-private.h"
+#include "MagickCore/thread-private.h"
+#include "MagickCore/threshold.h"
+#include "MagickCore/token.h"
+#include "MagickCore/transform.h"
+#include "MagickCore/xml-tree.h"
+#include "MagickCore/xml-tree-private.h"
+
+/*
+  Define declarations.
+*/
+#define ThresholdsFilename  "thresholds.xml"
+
+/*
+  Typedef declarations.
+*/
+struct _ThresholdMap
+{
+  char
+    *map_id,
+    *description;
+
+  size_t
+    width,
+    height;
+
+  ssize_t
+    divisor,
+    *levels;
+};
+
+/*
+  Static declarations.
+*/
+static const char
+  *MinimalThresholdMap =
+    "<?xml version=\"1.0\"?>"
+    "<thresholds>"
+    "  <threshold map=\"threshold\" alias=\"1x1\">"
+    "    <description>Threshold 1x1 (non-dither)</description>"
+    "    <levels width=\"1\" height=\"1\" divisor=\"2\">"
+    "        1"
+    "    </levels>"
+    "  </threshold>"
+    "  <threshold map=\"checks\" alias=\"2x1\">"
+    "    <description>Checkerboard 2x1 (dither)</description>"
+    "    <levels width=\"2\" height=\"2\" divisor=\"3\">"
+    "       1 2"
+    "       2 1"
+    "    </levels>"
+    "  </threshold>"
+    "</thresholds>";
+
+/*
+  Forward declarations.
+*/
+static ThresholdMap
+  *GetThresholdMapFile(const char *,const char *,const char *,ExceptionInfo *);
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%     A d a p t i v e T h r e s h o l d I m a g e                             %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  AdaptiveThresholdImage() selects an individual threshold for each pixel
+%  based on the range of intensity values in its local neighborhood.  This
+%  allows for thresholding of an image whose global intensity histogram
+%  doesn't contain distinctive peaks.
+%
+%  The format of the AdaptiveThresholdImage method is:
+%
+%      Image *AdaptiveThresholdImage(const Image *image,const size_t width,
+%        const size_t height,const double bias,ExceptionInfo *exception)
+%
+%  A description of each parameter follows:
+%
+%    o image: the image.
+%
+%    o width: the width of the local neighborhood.
+%
+%    o height: the height of the local neighborhood.
+%
+%    o bias: the mean bias.
+%
+%    o exception: return any errors or warnings in this structure.
+%
+*/
+MagickExport Image *AdaptiveThresholdImage(const Image *image,
+  const size_t width,const size_t height,const double bias,
+  ExceptionInfo *exception)
+{
+#define AdaptiveThresholdImageTag  "AdaptiveThreshold/Image"
+
+  CacheView
+    *image_view,
+    *threshold_view;
+
+  Image
+    *threshold_image;
+
+  MagickBooleanType
+    status;
+
+  MagickOffsetType
+    progress;
+
+  MagickSizeType
+    number_pixels;
+
+  ssize_t
+    y;
+
+  /*
+    Initialize threshold image attributes.
+  */
+  assert(image != (Image *) NULL);
+  assert(image->signature == MagickCoreSignature);
+  if (image->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
+  assert(exception != (ExceptionInfo *) NULL);
+  assert(exception->signature == MagickCoreSignature);
+  threshold_image=CloneImage(image,0,0,MagickTrue,exception);
+  if (threshold_image == (Image *) NULL)
+    return((Image *) NULL);
+    //BUGGY LINE, need to check height as well
+  if ((width == 0) 
+  //response 
+  || (width > image->columns))
+    width=image->columns;

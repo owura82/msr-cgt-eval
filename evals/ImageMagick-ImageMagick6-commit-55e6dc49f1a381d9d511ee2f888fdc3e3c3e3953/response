@@ -1,0 +1,222 @@
+//c file
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%       TTTTT  H   H  RRRR   EEEEE  SSSSS  H   H   OOO   L      DDDD          %
+%         T    H   H  R   R  E      SS     H   H  O   O  L      D   D         %
+%         T    HHHHH  RRRR   EEE     SSS   HHHHH  O   O  L      D   D         %
+%         T    H   H  R R    E         SS  H   H  O   O  L      D   D         %
+%         T    H   H  R  R   EEEEE  SSSSS  H   H   OOO   LLLLL  DDDD          %
+%                                                                             %
+%                                                                             %
+%                      MagickCore Image Threshold Methods                     %
+%                                                                             %
+%                               Software Design                               %
+%                                    Cristy                                   %
+%                                 October 1996                                %
+%                                                                             %
+%                                                                             %
+%  Copyright 1999-2019 ImageMagick Studio LLC, a non-profit organization      %
+%  dedicated to making software imaging solutions freely available.           %
+%                                                                             %
+%  You may not use this file except in compliance with the License.  You may  %
+%  obtain a copy of the License at                                            %
+%                                                                             %
+%    https://imagemagick.org/script/license.php                               %
+%                                                                             %
+%  Unless required by applicable law or agreed to in writing, software        %
+%  distributed under the License is distributed on an "AS IS" BASIS,          %
+%  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   %
+%  See the License for the specific language governing permissions and        %
+%  limitations under the License.                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%
+%
+*/
+
+/*
+  Include declarations.
+*/
+#include "magick/studio.h"
+#include "magick/property.h"
+#include "magick/blob.h"
+#include "magick/cache-view.h"
+#include "magick/color.h"
+#include "magick/color-private.h"
+#include "magick/colormap.h"
+#include "magick/colorspace.h"
+#include "magick/colorspace-private.h"
+#include "magick/configure.h"
+#include "magick/constitute.h"
+#include "magick/decorate.h"
+#include "magick/draw.h"
+#include "magick/enhance.h"
+#include "magick/exception.h"
+#include "magick/exception-private.h"
+#include "magick/effect.h"
+#include "magick/fx.h"
+#include "magick/gem.h"
+#include "magick/geometry.h"
+#include "magick/image-private.h"
+#include "magick/list.h"
+#include "magick/log.h"
+#include "magick/memory_.h"
+#include "magick/monitor.h"
+#include "magick/monitor-private.h"
+#include "magick/montage.h"
+#include "magick/option.h"
+#include "magick/pixel-private.h"
+#include "magick/quantize.h"
+#include "magick/quantum.h"
+#include "magick/random_.h"
+#include "magick/random-private.h"
+#include "magick/resize.h"
+#include "magick/resource_.h"
+#include "magick/segment.h"
+#include "magick/shear.h"
+#include "magick/signature-private.h"
+#include "magick/string_.h"
+#include "magick/string-private.h"
+#include "magick/thread-private.h"
+#include "magick/threshold.h"
+#include "magick/transform.h"
+#include "magick/xml-tree.h"
+
+/*
+  Define declarations.
+*/
+#define ThresholdsFilename  "thresholds.xml"
+
+/*
+  Typedef declarations.
+*/
+struct _ThresholdMap
+{
+  char
+    *map_id,
+    *description;
+
+  size_t
+    width,
+    height;
+
+  ssize_t
+    divisor,
+    *levels;
+};
+
+/*
+  Static declarations.
+*/
+static const char
+  *MinimalThresholdMap =
+    "<?xml version=\"1.0\"?>"
+    "<thresholds>"
+    "  <threshold map=\"threshold\" alias=\"1x1\">"
+    "    <description>Threshold 1x1 (non-dither)</description>"
+    "    <levels width=\"1\" height=\"1\" divisor=\"2\">"
+    "        1"
+    "    </levels>"
+    "  </threshold>"
+    "  <threshold map=\"checks\" alias=\"2x1\">"
+    "    <description>Checkerboard 2x1 (dither)</description>"
+    "    <levels width=\"2\" height=\"2\" divisor=\"3\">"
+    "       1 2"
+    "       2 1"
+    "    </levels>"
+    "  </threshold>"
+    "</thresholds>";
+
+/*
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%     A d a p t i v e T h r e s h o l d I m a g e                             %
+%                                                                             %
+%                                                                             %
+%                                                                             %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  AdaptiveThresholdImage() selects an individual threshold for each pixel
+%  based on the range of intensity values in its local neighborhood.  This
+%  allows for thresholding of an image whose global intensity histogram
+%  doesn't contain distinctive peaks.
+%
+%  The format of the AdaptiveThresholdImage method is:
+%
+%      Image *AdaptiveThresholdImage(const Image *image,
+%        const size_t width,const size_t height,
+%        const ssize_t offset,ExceptionInfo *exception)
+%
+%  A description of each parameter follows:
+%
+%    o image: the image.
+%
+%    o width: the width of the local neighborhood.
+%
+%    o height: the height of the local neighborhood.
+%
+%    o offset: the mean offset.
+%
+%    o exception: return any errors or warnings in this structure.
+%
+*/
+MagickExport Image *AdaptiveThresholdImage(const Image *image,
+  const size_t width,const size_t height,const ssize_t offset,
+  ExceptionInfo *exception)
+{
+#define ThresholdImageTag  "Threshold/Image"
+
+  CacheView
+    *image_view,
+    *threshold_view;
+
+  Image
+    *threshold_image;
+
+  MagickBooleanType
+    status;
+
+  MagickOffsetType
+    progress;
+
+  MagickPixelPacket
+    zero;
+
+  MagickRealType
+    number_pixels;
+
+  ssize_t
+    y;
+
+  assert(image != (const Image *) NULL);
+  assert(image->signature == MagickCoreSignature);
+  if (image->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"%s",image->filename);
+  assert(exception != (ExceptionInfo *) NULL);
+  assert(exception->signature == MagickCoreSignature);
+  threshold_image=CloneImage(image,0,0,MagickTrue,exception);
+  if (threshold_image == (Image *) NULL)
+    return((Image *) NULL);
+
+//BUGGY LOCATION 
+//response
+  /*
+    Initialize threshold image to zero.
+  */
+  zero.red=zero.green=zero.blue=zero.opacity=0.0;
+  (void) SetImage(threshold_image,&zero,exception);
+  if (threshold_image->debug != MagickFalse)
+    (void) LogMagickEvent(TraceEvent,GetMagickModule(),"...");
+  /*
+    Threshold image.
+  */
+  status=MagickTrue;
+  progress=0;
+  image_view=AcquireVirtualCacheView(image,exception);
+  threshold_view=AcquireAuthenticCacheView(threshold_image,exception);

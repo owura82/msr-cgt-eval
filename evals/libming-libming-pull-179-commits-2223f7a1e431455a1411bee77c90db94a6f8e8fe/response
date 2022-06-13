@@ -1,0 +1,119 @@
+//C file
+/*
+    Ming, an SWF output library
+    Copyright (C) 2002  Opaque Industries - http://www.opaque.net/
+
+    This library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public
+    License along with this library; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+*/
+
+/* $Id$ */
+
+#ifndef __C2MAN__
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#endif
+
+#ifndef WIN32
+#include <unistd.h>
+#endif
+
+#include "libming.h"
+#include "input.h"
+#include "method.h"
+#include "error.h"
+
+
+struct SWFInput_s
+{
+	void (*destroy)(SWFInput This);
+	int (*getChar)(SWFInput This);
+	int (*read)(SWFInput This, unsigned char* buffer, int count);
+	void (*seek)(SWFInput This, long offset, int whence);
+	int (*eof)(SWFInput This);
+
+	int offset;
+	int length;
+	void *data;
+#if TRACK_ALLOCS
+	/* memory node for garbage collection */
+	mem_node *gcnode;
+#endif
+	int buffer;
+	int bufbits;
+};
+
+void
+SWFInput_byteAlign(SWFInput input)
+{
+	if(input->bufbits > 0)
+	{
+		input->bufbits = 0;
+		input->buffer = 0;
+	}
+}
+
+int
+SWFInput_readBits(SWFInput input, int number)
+{
+	int ret = input->buffer;
+	if ( number == input->bufbits )
+	{
+		input->bufbits = 0;
+		input->buffer = 0;
+		return ret;
+	}
+
+	if ( number > input->bufbits )
+	{
+		number -= input->bufbits;
+
+		while( number > 8 )
+		{
+			ret <<= 8;
+			ret += SWFInput_getChar(input);
+			number -= 8;
+		}
+
+		input->buffer = SWFInput_getChar(input);
+
+		if ( number > 0 )
+		{
+			ret <<= number;
+			input->bufbits = 8-number;
+			ret += input->buffer >> (8-number);
+			input->buffer &= (1<<input->bufbits)-1;
+		}
+
+		return ret;
+	}
+
+	ret = input->buffer >> (input->bufbits-number);
+	input->bufbits -= number;
+	input->buffer &= (1<<input->bufbits)-1;
+//	printf("done: readBits(%i) numer < bufbits %i\n", number, ret);
+	return ret;
+}
+
+int
+SWFInput_readSBits(SWFInput input, int number)
+{
+	int num = SWFInput_readBits(input, number);
+
+//BUGGY LINE 
+//reponse
+	if(num & (1<<(number-1)))

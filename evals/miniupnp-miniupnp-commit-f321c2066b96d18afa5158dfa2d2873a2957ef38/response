@@ -1,0 +1,366 @@
+//c file
+/* $Id: upnpredirect.c,v 1.95 2018/07/06 12:05:48 nanard Exp $ */
+/* vim: tabstop=4 shiftwidth=4 noexpandtab
+ * MiniUPnP project
+ * http://miniupnp.free.fr/ or https://miniupnp.tuxfamily.org/
+ * (c) 2006-2018 Thomas Bernard
+ * This software is subject to the conditions detailed
+ * in the LICENCE file provided within the distribution */
+
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+
+#include <stdio.h>
+#include <ctype.h>
+#include <unistd.h>
+
+#include "macros.h"
+#include "config.h"
+#include "upnpredirect.h"
+#include "upnpglobalvars.h"
+#include "upnpevents.h"
+#include "portinuse.h"
+#include "upnputils.h"
+#if defined(USE_NETFILTER)
+#include "netfilter/iptcrdr.h"
+#endif
+#if defined(USE_PF)
+#include "pf/obsdrdr.h"
+#endif
+#if defined(USE_IPF)
+#include "ipf/ipfrdr.h"
+#endif
+#if defined(USE_IPFW)
+#include "ipfw/ipfwrdr.h"
+#endif
+#ifdef USE_MINIUPNPDCTL
+#include <stdio.h>
+#include <unistd.h>
+#endif
+#ifdef ENABLE_LEASEFILE
+#include <sys/stat.h>
+#endif
+
+/* from <inttypes.h> */
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+
+/* proto_atoi()
+ * convert the string "UDP" or "TCP" to IPPROTO_UDP and IPPROTO_UDP */
+static int
+proto_atoi(const char * protocol)
+{
+	int proto = IPPROTO_TCP;
+	if(strcasecmp(protocol, "UDP") == 0)
+		proto = IPPROTO_UDP;
+#ifdef IPPROTO_UDPLITE
+	else if(strcasecmp(protocol, "UDPLITE") == 0)
+		proto = IPPROTO_UDPLITE;
+#endif /* IPPROTO_UDPLITE */
+	return proto;
+}
+
+/* proto_itoa()
+ * convert IPPROTO_UDP, IPPROTO_UDP, etc. to "UDP", "TCP" */
+static const char *
+proto_itoa(int proto)
+{
+	const char * protocol;
+	switch(proto) {
+	case IPPROTO_UDP:
+		protocol = "UDP";
+		break;
+	case IPPROTO_TCP:
+		protocol = "TCP";
+		break;
+#ifdef IPPROTO_UDPLITE
+	case IPPROTO_UDPLITE:
+		protocol = "UDPLITE";
+		break;
+#endif /* IPPROTO_UDPLITE */
+	default:
+		protocol = "*UNKNOWN*";
+	}
+	return protocol;
+}
+
+#ifdef ENABLE_LEASEFILE
+static int
+lease_file_add(unsigned short eport,
+               const char * iaddr,
+               unsigned short iport,
+               int proto,
+               const char * desc,
+               unsigned int timestamp)
+{
+	FILE * fd;
+
+	if (lease_file == NULL) return 0;
+
+	fd = fopen( lease_file, "a");
+	if (fd==NULL) {
+		syslog(LOG_ERR, "could not open lease file: %s", lease_file);
+		return -1;
+	}
+
+	/* convert our time to unix time
+     * if LEASEFILE_USE_REMAINING_TIME is defined, only the remaining time is stored */
+	if (timestamp != 0) {
+		timestamp -= upnp_time();
+#ifndef LEASEFILE_USE_REMAINING_TIME
+		timestamp += time(NULL);
+#endif
+	}
+
+	fprintf(fd, "%s:%hu:%s:%hu:%u:%s\n",
+	        proto_itoa(proto), eport, iaddr, iport,
+	        timestamp, desc);
+	fclose(fd);
+
+	return 0;
+}
+
+static int
+lease_file_remove(unsigned short eport, int proto)
+{
+	FILE* fd, *fdt;
+	int tmp;
+	char buf[512];
+	char str[32];
+	char tmpfilename[128];
+	int str_size, buf_size;
+
+
+	if (lease_file == NULL) return 0;
+
+	if (strlen( lease_file) + 7 > sizeof(tmpfilename)) {
+		syslog(LOG_ERR, "Lease filename is too long");
+		return -1;
+	}
+
+	snprintf( tmpfilename, sizeof(tmpfilename), "%sXXXXXX", lease_file);
+
+	fd = fopen( lease_file, "r");
+	if (fd==NULL) {
+		return 0;
+	}
+
+	snprintf( str, sizeof(str), "%s:%u", proto_itoa(proto), eport);
+	str_size = strlen(str);
+
+	tmp = mkstemp(tmpfilename);
+	if (tmp==-1) {
+		fclose(fd);
+		syslog(LOG_ERR, "could not open temporary lease file");
+		return -1;
+	}
+	fchmod(tmp, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	fdt = fdopen(tmp, "a");
+
+	buf[sizeof(buf)-1] = 0;
+	while( fgets(buf, sizeof(buf)-1, fd) != NULL) {
+		buf_size = strlen(buf);
+
+		if (buf_size < str_size || strncmp(str, buf, str_size)!=0) {
+			fwrite(buf, buf_size, 1, fdt);
+		}
+	}
+	fclose(fdt);
+	fclose(fd);
+
+	if (rename(tmpfilename, lease_file) < 0) {
+		syslog(LOG_ERR, "could not rename temporary lease file to %s", lease_file);
+		remove(tmpfilename);
+	}
+
+	return 0;
+
+}
+
+/* reload_from_lease_file()
+ * read lease_file and add the rules contained
+ */
+int reload_from_lease_file()
+{
+	FILE * fd;
+	char * p;
+	unsigned short eport, iport;
+	char * proto;
+	char * iaddr;
+	char * desc;
+	char * rhost;
+	unsigned int leaseduration;
+	unsigned int timestamp;
+	time_t current_time;
+#ifndef LEASEFILE_USE_REMAINING_TIME
+	time_t current_unix_time;
+#endif
+	char line[128];
+	int r;
+
+	if(!lease_file) return -1;
+	fd = fopen( lease_file, "r");
+	if (fd==NULL) {
+		syslog(LOG_ERR, "could not open lease file: %s", lease_file);
+		return -1;
+	}
+	if(unlink(lease_file) < 0) {
+		syslog(LOG_WARNING, "could not unlink file %s : %m", lease_file);
+	}
+
+	current_time = upnp_time();
+#ifndef LEASEFILE_USE_REMAINING_TIME
+	current_unix_time = time(NULL);
+#endif
+	while(fgets(line, sizeof(line), fd)) {
+		syslog(LOG_DEBUG, "parsing lease file line '%s'", line);
+		proto = line;
+		p = strchr(line, ':');
+		if(!p) {
+			syslog(LOG_ERR, "unrecognized data in lease file");
+			continue;
+		}
+		*(p++) = '\0';
+		iaddr = strchr(p, ':');
+		if(!iaddr) {
+			syslog(LOG_ERR, "unrecognized data in lease file");
+			continue;
+		}
+		*(iaddr++) = '\0';
+		eport = (unsigned short)atoi(p);
+		p = strchr(iaddr, ':');
+		if(!p) {
+			syslog(LOG_ERR, "unrecognized data in lease file");
+			continue;
+		}
+		*(p++) = '\0';
+		iport = (unsigned short)atoi(p);
+		p = strchr(p, ':');
+		if(!p) {
+			syslog(LOG_ERR, "unrecognized data in lease file");
+			continue;
+		}
+		*(p++) = '\0';
+		desc = strchr(p, ':');
+		if(!desc) {
+			syslog(LOG_ERR, "unrecognized data in lease file");
+			continue;
+		}
+		*(desc++) = '\0';
+		/*timestamp = (unsigned int)atoi(p);*/
+		timestamp = (unsigned int)strtoul(p, NULL, 10);
+		/* trim description */
+		while(isspace(*desc))
+			desc++;
+		p = desc;
+		while(*(p+1))
+			p++;
+		while(isspace(*p) && (p > desc))
+			*(p--) = '\0';
+
+		if(timestamp > 0) {
+#ifdef LEASEFILE_USE_REMAINING_TIME
+			leaseduration = timestamp;
+			timestamp += current_time;	/* convert to our time */
+#else
+			if(timestamp <= (unsigned int)current_unix_time) {
+				syslog(LOG_NOTICE, "already expired lease in lease file");
+				continue;
+			} else {
+				leaseduration = timestamp - current_unix_time;
+				timestamp = leaseduration + current_time; /* convert to our time */
+			}
+#endif
+		} else {
+			leaseduration = 0;	/* default value */
+		}
+		rhost = NULL;
+		r = upnp_redirect(rhost, eport, iaddr, iport, proto, desc, leaseduration);
+		if(r == -1) {
+			syslog(LOG_ERR, "Failed to redirect %hu -> %s:%hu protocol %s",
+			       eport, iaddr, iport, proto);
+		} else if(r == -2) {
+			/* Add the redirection again to the lease file */
+			lease_file_add(eport, iaddr, iport, proto_atoi(proto),
+			               desc, timestamp);
+		}
+	}
+	fclose(fd);
+
+	return 0;
+}
+
+#ifdef LEASEFILE_USE_REMAINING_TIME
+void lease_file_rewrite(void)
+{
+	int index;
+	unsigned short eport, iport;
+	int proto;
+	char iaddr[32];
+	char desc[64];
+	char rhost[40];
+	unsigned int timestamp;
+
+	if (lease_file == NULL) return;
+	remove(lease_file);
+	for(index = 0; ; index++) {
+		if(get_redirect_rule_by_index(index, 0/*ifname*/, &eport, iaddr, sizeof(iaddr),
+		                              &iport, &proto, desc, sizeof(desc),
+		                              rhost, sizeof(rhost), &timestamp,
+		                              0, 0) < 0)
+			break;
+		if(lease_file_add(eport, iaddr, iport, proto, desc, timestamp) < 0)
+			break;
+	}
+}
+#endif
+#endif
+
+/* upnp_redirect()
+ * calls OS/fw dependent implementation of the redirection.
+ * protocol should be the string "TCP" or "UDP"
+ * returns: 0 on success
+ *          -1 failed to redirect
+ *          -2 already redirected
+ *          -3 permission check failed
+ *          -4 already redirected (other mechanism)
+ */
+int
+upnp_redirect(const char * rhost, unsigned short eport,
+              const char * iaddr, unsigned short iport,
+              const char * protocol, const char * desc,
+              unsigned int leaseduration)
+{
+	int proto, r;
+	char iaddr_old[32];
+	char rhost_old[32];
+	unsigned short iport_old;
+	struct in_addr address;
+	unsigned int timestamp;
+
+	proto = proto_atoi(protocol);
+	if(inet_aton(iaddr, &address) <= 0) {
+		syslog(LOG_ERR, "inet_aton(%s) FAILED", iaddr);
+		return -1;
+	}
+
+	if(!check_upnp_rule_against_permissions(upnppermlist, num_upnpperm,
+	                                        eport, address, iport)) {
+		syslog(LOG_INFO, "redirection permission check failed for "
+		                 "%hu->%s:%hu %s", eport, iaddr, iport, protocol);
+		return -3;
+	}
+	
+	//response
+	r = get_redirect_rule_by_eport(eport, iaddr_old, sizeof(iaddr_old),
+	                               &iport_old, rhost_old, sizeof(rhost_old),
+	                               &proto, &timestamp);
+
+

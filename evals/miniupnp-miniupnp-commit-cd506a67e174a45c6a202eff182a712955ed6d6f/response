@@ -1,0 +1,325 @@
+//c file
+/* $Id: minissdpd.c,v 1.53 2016/03/01 18:06:46 nanard Exp $ */
+/* vim: tabstop=4 shiftwidth=4 noexpandtab
+ * MiniUPnP project
+ * (c) 2007-2018 Thomas Bernard
+ * website : http://miniupnp.free.fr/ or https://miniupnp.tuxfamily.org/
+ * This software is subject to the conditions detailed
+ * in the LICENCE file provided within the distribution */
+
+#include "config.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <syslog.h>
+#include <ctype.h>
+#include <time.h>
+#include <sys/queue.h>
+/* for chmod : */
+#include <sys/stat.h>
+/* unix sockets */
+#include <sys/un.h>
+/* for getpwnam() and getgrnam() */
+#if 0
+#include <pwd.h>
+#include <grp.h>
+#endif
+
+/* LOG_PERROR does not exist on Solaris */
+#ifndef LOG_PERROR
+#define LOG_PERROR 0
+#endif /* LOG_PERROR */
+
+#include "getifaddr.h"
+#include "upnputils.h"
+#include "openssdpsocket.h"
+#include "daemonize.h"
+#include "codelength.h"
+#include "ifacewatch.h"
+#include "minissdpdtypes.h"
+#include "asyncsendto.h"
+
+#define SET_MAX(max, x)	if((x) > (max)) (max) = (x)
+#ifndef MIN
+#define MIN(x,y) (((x)<(y))?(x):(y))
+#endif
+
+/* current request management structure */
+struct reqelem {
+	int socket;
+	int is_notify;	/* has subscribed to notifications */
+	LIST_ENTRY(reqelem) entries;
+	unsigned char * output_buffer;
+	int output_buffer_offset;
+	int output_buffer_len;
+};
+
+/* device data structures */
+struct header {
+	const char * p; /* string pointer */
+	int l;          /* string length */
+};
+
+#define HEADER_NT	0
+#define HEADER_USN	1
+#define HEADER_LOCATION	2
+
+struct device {
+	struct device * next;
+	time_t t;                 /* validity time */
+	struct header headers[3]; /* NT, USN and LOCATION headers */
+	char data[];
+};
+
+/* Services stored for answering to M-SEARCH */
+struct service {
+	char * st;	/* Service type */
+	char * usn;	/* Unique identifier */
+	char * server;	/* Server string */
+	char * location;	/* URL */
+	LIST_ENTRY(service) entries;
+};
+LIST_HEAD(servicehead, service) servicelisthead;
+
+#define NTS_SSDP_ALIVE	1
+#define NTS_SSDP_BYEBYE	2
+#define NTS_SSDP_UPDATE	3
+
+/* request types */
+enum request_type {
+	MINISSDPD_GET_VERSION = 0,
+	MINISSDPD_SEARCH_TYPE = 1,
+	MINISSDPD_SEARCH_USN = 2,
+	MINISSDPD_SEARCH_ALL = 3,
+	MINISSDPD_SUBMIT = 4,
+	MINISSDPD_NOTIF = 5
+};
+
+/* discovered device list kept in memory */
+struct device * devlist = 0;
+
+/* bootid and configid */
+unsigned int upnp_bootid = 1;
+unsigned int upnp_configid = 1337;
+
+/* LAN interfaces/addresses */
+struct lan_addr_list lan_addrs;
+
+/* connected clients */
+LIST_HEAD(reqstructhead, reqelem) reqlisthead;
+
+/* functions prototypes */
+
+#define NOTIF_NEW    1
+#define NOTIF_UPDATE 2
+#define NOTIF_REMOVE 3
+static void
+sendNotifications(int notif_type, const struct device * dev, const struct service * serv);
+
+/* functions */
+
+/* parselanaddr()
+ * parse address with mask
+ * ex: 192.168.1.1/24 or 192.168.1.1/255.255.255.0
+ *
+ * Can also use the interface name (ie eth0)
+ *
+ * return value :
+ *    0 : ok
+ *   -1 : error */
+static int
+parselanaddr(struct lan_addr_s * lan_addr, const char * str)
+{
+	const char * p;
+	int n;
+	char tmp[16];
+
+	memset(lan_addr, 0, sizeof(struct lan_addr_s));
+	p = str;
+	while(*p && *p != '/' && !isspace(*p))
+		p++;
+	n = p - str;
+	if(!isdigit(str[0]) && n < (int)sizeof(lan_addr->ifname)) {
+		/* not starting with a digit : suppose it is an interface name */
+		memcpy(lan_addr->ifname, str, n);
+		lan_addr->ifname[n] = '\0';
+		if(getifaddr(lan_addr->ifname, lan_addr->str, sizeof(lan_addr->str),
+		             &lan_addr->addr, &lan_addr->mask) < 0)
+			goto parselan_error;
+		/*printf("%s => %s\n", lan_addr->ifname, lan_addr->str);*/
+	} else {
+		if(n>15)
+			goto parselan_error;
+		memcpy(lan_addr->str, str, n);
+		lan_addr->str[n] = '\0';
+		if(!inet_aton(lan_addr->str, &lan_addr->addr))
+			goto parselan_error;
+	}
+	if(*p == '/') {
+		const char * q = ++p;
+		while(*p && isdigit(*p))
+			p++;
+		if(*p=='.') {
+			/* parse mask in /255.255.255.0 format */
+			while(*p && (*p=='.' || isdigit(*p)))
+				p++;
+			n = p - q;
+			if(n>15)
+				goto parselan_error;
+			memcpy(tmp, q, n);
+			tmp[n] = '\0';
+			if(!inet_aton(tmp, &lan_addr->mask))
+				goto parselan_error;
+		} else {
+			/* it is a /24 format */
+			int nbits = atoi(q);
+			if(nbits > 32 || nbits < 0)
+				goto parselan_error;
+			lan_addr->mask.s_addr = htonl(nbits ? (0xffffffffu << (32 - nbits)) : 0);
+		}
+	} else if(lan_addr->mask.s_addr == 0) {
+		/* by default, networks are /24 */
+		lan_addr->mask.s_addr = htonl(0xffffff00u);
+	}
+#ifdef ENABLE_IPV6
+	if(lan_addr->ifname[0] != '\0') {
+		lan_addr->index = if_nametoindex(lan_addr->ifname);
+		if(lan_addr->index == 0)
+			fprintf(stderr, "Cannot get index for network interface %s",
+			        lan_addr->ifname);
+	} else {
+		fprintf(stderr,
+		        "Error: please specify LAN network interface by name instead of IPv4 address : %s\n",
+		        str);
+		return -1;
+	}
+#endif /* ENABLE_IPV6 */
+	return 0;
+parselan_error:
+	fprintf(stderr, "Error parsing address/mask (or interface name) : %s\n",
+	        str);
+	return -1;
+}
+
+static int
+write_buffer(struct reqelem * req)
+{
+	if(req->output_buffer && req->output_buffer_len > 0) {
+		int n = write(req->socket,
+		              req->output_buffer + req->output_buffer_offset,
+		              req->output_buffer_len);
+		if(n >= 0) {
+			req->output_buffer_offset += n;
+			req->output_buffer_len -= n;
+		} else if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN) {
+			return 0;
+		}
+		return n;
+	} else {
+		return 0;
+	}
+}
+
+static int
+add_to_buffer(struct reqelem * req, const unsigned char * data, int len)
+{
+	unsigned char * tmp;
+	if(req->output_buffer_offset > 0) {
+		memmove(req->output_buffer, req->output_buffer + req->output_buffer_offset, req->output_buffer_len);
+		req->output_buffer_offset = 0;
+	}
+	tmp = realloc(req->output_buffer, req->output_buffer_len + len);
+	if(tmp == NULL) {
+		syslog(LOG_ERR, "%s: failed to allocate %d bytes",
+		       __func__, req->output_buffer_len + len);
+		return -1;
+	}
+	req->output_buffer = tmp;
+	memcpy(req->output_buffer + req->output_buffer_len, data, len);
+	req->output_buffer_len += len;
+	return len;
+}
+
+static int
+write_or_buffer(struct reqelem * req, const unsigned char * data, int len)
+{
+	if(write_buffer(req) < 0)
+		return -1;
+	if(req->output_buffer && req->output_buffer_len > 0) {
+		return add_to_buffer(req, data, len);
+	} else {
+		int n = write(req->socket, data, len);
+		if(n == len)
+			return len;
+		if(n < 0) {
+			if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN) {
+				n = add_to_buffer(req, data, len);
+				if(n < 0) return n;
+			} else {
+				return n;
+			}
+		} else {
+			n = add_to_buffer(req, data + n, len - n);
+			if(n < 0) return n;
+		}
+	}
+	return len;
+}
+
+static const char *
+nts_to_str(int nts)
+{
+	switch(nts)
+	{
+	case NTS_SSDP_ALIVE:
+		return "ssdp:alive";
+	case NTS_SSDP_BYEBYE:
+		return "ssdp:byebye";
+	case NTS_SSDP_UPDATE:
+		return "ssdp:update";
+	}
+	return "unknown";
+}
+
+/* updateDevice() :
+ * adds or updates the device to the list.
+ * return value :
+ *   0 : the device was updated (or nothing done)
+ *   1 : the device was new    */
+static int
+updateDevice(const struct header * headers, time_t t)
+{
+	struct device ** pp = &devlist;
+	struct device * p = *pp;	/* = devlist; */
+	while(p)
+	{
+		if(  p->headers[HEADER_NT].l == headers[HEADER_NT].l
+		  && (0==memcmp(p->headers[HEADER_NT].p, headers[HEADER_NT].p, headers[HEADER_NT].l))
+		  && p->headers[HEADER_USN].l == headers[HEADER_USN].l
+		  && (0==memcmp(p->headers[HEADER_USN].p, headers[HEADER_USN].p, headers[HEADER_USN].l)) )
+		{
+			/*printf("found! %d\n", (int)(t - p->t));*/
+			syslog(LOG_DEBUG, "device updated : %.*s", headers[HEADER_USN].l, headers[HEADER_USN].p);
+			p->t = t;
+			/* update Location ! */
+			if(headers[HEADER_LOCATION].l > p->headers[HEADER_LOCATION].l)
+			{
+				struct device * tmp;
+				tmp = realloc(p, sizeof(struct device)
+				    + headers[0].l+headers[1].l+headers[2].l);
+				if(!tmp)	/* allocation error */
+				{
+					syslog(LOG_ERR, "updateDevice() : memory allocation error");
+					//reponse
+					return 0;
+          
+					
