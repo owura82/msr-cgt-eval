@@ -3234,8 +3234,7 @@ static int set_geometry(unsigned int cmd, struct floppy_struct *g,
 	int cnt;
 
 	/* sanity checking for parameters. */
+	//response
 	if ((int)g->sect <= 0 ||
 	    (int)g->head <= 0 ||
-
-      //BUGGY location - response
 	    (int)g->track <= 0 ||

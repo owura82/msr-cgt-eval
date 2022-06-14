@@ -213,8 +213,7 @@ MagickExport Image *AdaptiveThresholdImage(const Image *image,
   threshold_image=CloneImage(image,0,0,MagickTrue,exception);
   if (threshold_image == (Image *) NULL)
     return((Image *) NULL);
-    //BUGGY LINE, need to check height as well
-  if ((width == 0) 
-  //response 
-  || (width > image->columns))
+  
+  //response
+  if ((width == 0) || (width > image->columns))
     width=image->columns;

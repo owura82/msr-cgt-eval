@@ -784,18 +784,7 @@ nvmet_fc_find_target_queue(struct nvmet_fc_tgtport *tgtport,
 	u16 qid = nvmet_fc_getqueueid(connection_id);
 	unsigned long flags;
 
-//BUGGY LOCATION - response
+	//response
 	spin_lock_irqsave(&tgtport->lock, flags);
-	assoc = tgtport->assocs[association_id];
-	if (!assoc) {
-		spin_unlock_irqrestore(&tgtport->lock, flags);
-		return NULL;
-	}
-	spin_unlock_irqrestore(&tgtport->lock, flags);
 
-	spin_lock_irqsave(&assoc->tgtport->lock, flags);
-	queue = assoc->queues[qid];
-	spin_unlock_irqrestore(&assoc->tgtport->lock, flags);
-
-	return queue;
 }

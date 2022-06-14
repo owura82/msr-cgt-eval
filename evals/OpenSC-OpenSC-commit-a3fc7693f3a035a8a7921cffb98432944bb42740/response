@@ -1469,7 +1469,5 @@ static int asn1_decode_entry(sc_context_t *ctx,struct sc_asn1_entry *entry,
 			assert(len != NULL);
 
 			/* Strip off padding zero */
-			if ((entry->flags & SC_ASN1_UNSIGNED)
-					&& 
-					//response
-					(obj[0] & 0x80)) {
+			//response
+			if ((entry->flags & SC_ASN1_UNSIGNED) && (obj[0] & 0x80)) {}

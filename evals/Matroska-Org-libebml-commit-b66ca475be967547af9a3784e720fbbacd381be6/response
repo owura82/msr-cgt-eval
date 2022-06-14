@@ -479,8 +479,6 @@ EbmlElement * EbmlElement::FindNextElement(IOCallback & DataStream, const EbmlSe
     ReadIndex = SizeIdx - 1;
     memmove(&PossibleIdNSize[0], &PossibleIdNSize[1], ReadIndex);
     UpperLevel = UpperLevel_original;
-    //BUGGY line below
 
-  } while ( MaxDataSize 
-  //response 
-  > ReadSize );
+  //response
+  } while ( MaxDataSize > ReadSize );

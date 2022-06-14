@@ -1040,7 +1040,7 @@ static void DetectRunCleanup(DetectEngineThreadCtx *det_ctx,
 
     if (pflow != NULL) {
         /* update inspected tracker for raw reassembly */
-        if (p->proto == IPPROTO_TCP && pflow->protoctx != NULL) //BUGGY line, need another check on p->flags
+        if (p->proto == IPPROTO_TCP && pflow->protoctx != NULL)         //BUGGY line, need another check on p->flags
         {
             StreamReassembleRawUpdateProgress(pflow->protoctx, p,
                     det_ctx->raw_stream_progress);

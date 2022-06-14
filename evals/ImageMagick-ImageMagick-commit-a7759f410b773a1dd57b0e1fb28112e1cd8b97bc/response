@@ -211,10 +211,9 @@ MagickExport Image *AdaptiveThresholdImage(const Image *image,
   assert(exception != (ExceptionInfo *) NULL);
   assert(exception->signature == MagickCoreSignature);
   threshold_image=CloneImage(image,0,0,MagickTrue,exception);
+  
   if (threshold_image == (Image *) NULL)
     return((Image *) NULL);
-
-  //BUGGY LOCATION
   //response
   if (threshold_image->storage_class == PseudoClass)
     {

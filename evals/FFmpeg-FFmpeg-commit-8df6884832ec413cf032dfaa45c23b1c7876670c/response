@@ -1025,11 +1025,8 @@ end:
 
     return ret;
 free_and_end:
-//prompt here
-    if (avctx->codec && 
-    
     //response
-    avctx->codec->priv_class && avctx->priv_data) {
+    if (avctx->codec && avctx->codec->priv_class && avctx->priv_data) {
         av_opt_free(avctx->priv_data);
         avctx->priv_data = NULL;
     }

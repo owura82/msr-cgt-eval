@@ -425,13 +425,7 @@ void ImportEPUB::ExtractContainer()
 
             // If there is no file name then we can't do anything with it.
             if (!qfile_name.isEmpty()) {
-
-	        // for security reasons we need the file path to always be inside the
-                // target folder and not outside, so we will remove all relative upward
-                // paths segments ".." from the file path before prepending the target
-                // folder to create the final target path
-
-          //BUGGY LOCATION - response
+	        //response
                 QString target_path = QDir::toNativeSeparators(m_ExtractedFolderPath + "/" + qfile_name);
                 QString target_path_cp437 = QDir::toNativeSeparators(m_ExtractedFolderPath + "/" + cp437_file_name);
 

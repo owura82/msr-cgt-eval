@@ -204,8 +204,7 @@ MagickExport Image *AdaptiveThresholdImage(const Image *image,
   if (threshold_image == (Image *) NULL)
     return((Image *) NULL);
 
-//BUGGY LOCATION 
-//response
+  //response
   /*
     Initialize threshold image to zero.
   */

@@ -148,43 +148,8 @@ static av_cold int vqa_decode_init(AVCodecContext *avctx)
     }
     s->width = AV_RL16(&s->avctx->extradata[6]);
     s->height = AV_RL16(&s->avctx->extradata[8]);
-    //prompt here
-   if ((ret = 
+   
    //response
-   av_image_check_size(s->width, s->height, 0, s->avctx)) < 0)
+   if ((ret = av_image_check_size(s->width, s->height, 0, s->avctx)) < 0)
         return ret;
-    s->vector_width = s->avctx->extradata[10];
-    s->vector_height = s->avctx->extradata[12];
-    s->partial_countdown = s->avctx->extradata[14];
-    s->partial_count = s->partial_countdown;
-
-    /* allocate the codebook */
-    s->codebook_size = MAX_CODEBOOK_SIZE;
-    s->codebook = av_malloc(s->codebook_size);
-    if (!s->codebook)
-        return AVERROR(ENOMEM);
-
-    /* initialize the codebook */
-    for (i = 0; i < MAX_CODEBOOK_VECTORS; i++) {
-        for (j = 0; j < 4; j++) {
-            codebook_index = i * 4 + j;
-            s->codebook[codebook_index * 2] = s->avctx->extradata[16 + codebook_index * 2];
-            s->codebook[codebook_index * 2 + 1] = s->avctx->extradata[17 + codebook_index * 2];
-        }
-    }
-
-    /* initialize the palette */
-    for (i = 0; i < PALETTE_COUNT; i++) {
-        s->palette[i] = (s->avctx->extradata[48 + i * 3] << 16) |
-                        (s->avctx->extradata[49 + i * 3] << 8) |
-                        (s->avctx->extradata[50 + i * 3]);
-    }
-
-    /* initialize the decode buffer */
-    s->decode_buffer_size = s->width * s->height;
-    s->decode_buffer = av_malloc(s->decode_buffer_size);
-    if (!s->decode_buffer)
-        return AVERROR(ENOMEM);
-
-    /* initialize the next codebook buffer */
-    s->next_codebook_buffer_index = 0;
+    
