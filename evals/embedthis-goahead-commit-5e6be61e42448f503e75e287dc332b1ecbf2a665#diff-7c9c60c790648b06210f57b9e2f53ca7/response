@@ -139,7 +139,6 @@ PUBLIC bool cgiHandler(Webs *wp)
         query = sclone(wp->query);
         websDecodeUrl(query, query, strlen(query));
 
-
         //response
         for (tok = stok(query, "&", &query); tok != NULL; tok = stok(NULL, "&", &query)) {
             if (n >= argpsize) {

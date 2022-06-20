@@ -187,6 +187,5 @@ static int usb_console_setup(struct console *co, char *options)
 	tty_kref_put(tty);
  reset_open_count:
 	port->port.count = 0;
-	
 	//response
 	--port->port.count;
