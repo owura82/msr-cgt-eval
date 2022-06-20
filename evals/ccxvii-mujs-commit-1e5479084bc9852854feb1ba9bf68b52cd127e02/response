@@ -1024,7 +1024,6 @@ static void ctrycatchfinally(JF, js_Ast *trystm, js_Ast *catchvar, js_Ast *catch
 		emitstring(J, F, OP_CATCH, catchvar->string);
 		cstm(J, F, catchstm);
 		emit(J, F, OP_ENDCATCH);
-
 		//response
 		L3 = emitjump(J, F, OP_JUMP); /* skip past the try block */
 		

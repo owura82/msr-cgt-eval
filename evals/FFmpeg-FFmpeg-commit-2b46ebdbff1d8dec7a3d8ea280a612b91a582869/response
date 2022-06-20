@@ -706,8 +706,8 @@ static int parse_video_info(AVIOContext *pb, AVStream *st)
     st->codecpar->codec_tag = tag;
     st->codecpar->codec_id  = ff_codec_get_id(ff_codec_bmp_tags, tag);
     size_bmp = FFMAX(size_asf, size_bmp);
-
-//response
+    
+    //response
     if (size_bmp > BMP_HEADER_SIZE && size_bmp < BMP_HEADER_SIZE + 0x100) {
         avio_skip(pb, size_bmp - BMP_HEADER_SIZE);
     } else {

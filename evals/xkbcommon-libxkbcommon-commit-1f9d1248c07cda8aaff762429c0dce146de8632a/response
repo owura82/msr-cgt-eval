@@ -166,7 +166,6 @@ ExprResolveBoolean(struct xkb_context *ctx, const ExprDef *expr,
 
     case EXPR_INVERT:
     case EXPR_NOT:
-      
       //response
         ok = ExprResolveBoolean(ctx, expr->expr.left, set_rtrn);
 

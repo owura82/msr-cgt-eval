@@ -285,7 +285,6 @@ static int ipddp_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 			spin_lock_bh(&ipddp_route_lock);
 			rp = __ipddp_find_route(&rcp);
 			if (rp) {
-
                                 //response
                                 rcp2 = *rp;
                                 spin_unlock_bh(&ipddp_route_lock);

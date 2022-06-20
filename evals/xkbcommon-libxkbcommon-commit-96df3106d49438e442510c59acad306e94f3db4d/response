@@ -265,9 +265,7 @@ ResolveStateAndPredicate(ExprDef *expr, enum xkb_match_operation *pred_rtrn,
     *pred_rtrn = MATCH_EXACTLY;
     if (expr->expr.op == EXPR_ACTION_DECL) {
         const char *pred_txt = xkb_atom_text(info->ctx, expr->action.name);
-        //BUGGY LOCATION - check expression
         if (!LookupString(symInterpretMatchMaskNames, pred_txt, pred_rtrn) ||
-        
         //response
          *pred_rtrn == MATCH_ANY_OR_NONE) {
             log_warn(info->ctx, "Unknown match operation \"%s\"\n", pred_txt);

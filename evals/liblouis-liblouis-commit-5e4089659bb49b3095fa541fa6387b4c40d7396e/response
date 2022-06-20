@@ -356,7 +356,6 @@ matchCurrentInput(
 	int k;
 	int kk = pos;
 
-  //BUGGY LOCATION - potential buffer overflow in loop statement
 	for (k = passIC + 2;
 	//response
 	 k < passInstructions[passIC + 1]; k += 2) {
