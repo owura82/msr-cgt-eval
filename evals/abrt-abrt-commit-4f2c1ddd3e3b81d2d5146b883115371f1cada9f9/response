@@ -680,5 +680,4 @@ int main(int argc, char** argv)
         char *rootdir = get_rootdir(pid);
 
         //response
-        dd_create_basic_files(dd, pid, executable, user_pwd, rootdir,
-                proc_pid_status, argv, envp, signal_no, signame, fsuid);
+        dd_create_basic_files(dd, pid, executable, user_pwd, rootdir, proc_pid_status, argv, envp, signal_no, signame, fsuid);
