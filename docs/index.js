@@ -3,7 +3,7 @@ let fs = require('fs')
 function myfunct(){
     console.log("this is a function in javascript")
     
-    fs.readFile('temp.txt', function(err, data){
+    fs.readFileSync('temp.txt', function(err, data){
         console.log(typeof data)
         console.log(data)
     })
