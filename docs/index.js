@@ -1,20 +1,23 @@
-let fs = require('fs')
+
 
 function myfunct(){
-    console.log("this is a function in javascript")
+    console.log("new log message")
     
-    fs.readFileSync('temp.txt', function(err, data){
-        console.log(typeof data)
-        console.log(data)
-    })
+    var txt = '';
+    var xmlhttp = new XMLHttpRequest();
+    xmlhttp.onreadystatechange = function(){
+      if(xmlhttp.status == 200 && xmlhttp.readyState == 4){
+        txt = xmlhttp.responseText;
+        console.log(txt)
+      }
+    };
+    xmlhttp.open("GET","temp.txt",true);
+    xmlhttp.send();
+    
 }
 
 // function next_button_click(){
-//     // fs.readFile('temp.txt', function(err, data){
-//     //     console.log(typeof data)
-//     //     console.log(data)
-
-//     // })
+//     
 // }
 
 // next_button = getElementById('next-button');
