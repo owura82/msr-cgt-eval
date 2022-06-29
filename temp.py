@@ -1,3 +1,4 @@
+import enum
 from getopt import gnu_getopt
 import os
 
@@ -52,13 +53,31 @@ import os
 # print(count, cpp_count, c_count)
 
 # create latex table for dates of selected projects
-open('latex_table.txt', 'w').close()
-with open('first_hundred_with_date.csv', 'r') as f:
-    lines = f.readlines()
-    for i,line in enumerate(lines):
-        if i > 51:
-            line_arr = line.split(',')
-            to_write = str(i-51) + ' & '+ line_arr[0] + ' & '+ line_arr[1][:-1] + ' \\\\ \n\\hline\n'
-            with open('latex_table.txt', 'a') as g:
-                g.write(to_write)
+# open('latex_table.txt', 'w').close()
+# with open('first_hundred_with_date.csv', 'r') as f:
+#     lines = f.readlines()
+#     for i,line in enumerate(lines):
+#         if i > 51:
+#             line_arr = line.split(',')
+#             to_write = str(i-51) + ' & '+ line_arr[0] + ' & '+ line_arr[1][:-1] + ' \\\\ \n\\hline\n'
+#             with open('latex_table.txt', 'a') as g:
+#                 g.write(to_write)
         
+
+
+# create csv file of folder names of category c samples 
+def folder_name_from_link(link):
+    common = link.index('.com/')
+    return link[common+5:-1].replace('/', '-')
+
+with open('all_catC_samples.txt', 'r') as f:
+    links = f.readlines()
+
+with open('initialize_result_table.csv', 'w') as f:
+    for i,link in enumerate(links):
+        folder = folder_name_from_link(link)
+        pos = str(i+1)
+        to_write = pos+','+folder+',C'
+        if i < 86:
+            to_write += '\n'
+        f.write(to_write)
