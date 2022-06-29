@@ -26,6 +26,12 @@ function myfunct(){
     
 }
 
+// function next_button_click(){
+//     
+// }
 
+// next_button = getElementById('next-button');
+
+// next_button.addEventListener("click", next_button_click)
 
 document.addEventListener("DOMContentLoaded", myfunct);
