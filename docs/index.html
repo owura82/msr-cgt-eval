@@ -4,13 +4,118 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>HTML 5 Boilerplate</title>
-    <link rel="stylesheet" href="style.css">
+    <title>Coder Site</title>
+    <style>
+      /* #pic-container {
+        height: auto;
+      } */
+
+      /* #top {
+        border-style: dashed;
+        height: 80%;
+      } */
+
+      #top-left {
+        border-style: solid;
+        border-color: aqua;
+        height: fit-content;
+        width: fit-content;
+        position: absolute;
+        top: 5vh;
+        left: 5vw;
+      }
+      #top-right {
+        border-style: solid;
+        border-color: blueviolet;
+        height: fit-content;
+        width: fit-content;
+        position: absolute;
+        top: 5vh;
+        right: 5vw;
+      }
+      #bottom {
+        border-style: solid;
+        height: fit-content;
+        width: fit-content;
+        margin: auto;
+        position: absolute;
+        top: 50vh;
+        left: 0;
+        right: 0;
+      }
+
+      #tl-image {
+        max-width: 43vw;
+        max-height: 40vh;
+      }
+
+      #tr-image {
+        max-width: 43vw;
+        max-height: 40vh;
+      }
+
+      #bottom-image {
+        max-height: 40vh;
+      }
+
+      #form-container {
+        position: absolute;
+        top: 92vh;
+        left: 35vw;
+      }
+
+    </style>
   </head>
   <body>
 	<script src="index.js"></script>
-    <h1>Test heading here!!</h1>
-    <h2 id='holder'></h2>
-    <button type="button" id="next-button">Click here for next line</button>
+  
+  <div id="pic-container">
+
+      <!-- <div id="top-left">
+        <img src="../evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/A.png">
+      </div>
+
+      <div id="top-right">
+        <img src="../evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/B.png">
+      </div> -->
+
+      <div id="top-left">
+        <img id="tl-image" src="../evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+      </div>
+
+      <div id="top-right">
+        <img id="tr-image" src="../evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+      </div>
+
+    <div id="bottom">
+      <img id="bottom-image" src="../evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+    </div>
+
+  </div>
+
+  <div id="form-container">
+
+    <form action="">
+      <input type="button" name="back" id="back-button" value="Go to Previous Sample">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+
+      <label for="response">Top Left</label>
+      <input type="radio" id="fname" name="response">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+
+      <label for="response">Top Right</label>
+      <input type="radio" id="lname" name="response">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+      
+      <label for="response">Neither</label>
+      <input type="radio" id="neither" name="response">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+
+      <input type="submit" value="Submit Selection">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    </form>
+
+  </div>
+
   </body>
 </html>
