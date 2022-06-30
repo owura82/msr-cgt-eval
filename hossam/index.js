@@ -76,6 +76,45 @@ function handleFormSubmit(e){
 }
 
 
+function handlePreviousButtonClick() {
+  const sample_number = document.getElementById('sample-number').textContent;
+  const sample_folder = document.getElementById('sample-folder').textContent;
+
+  if (parseInt(sample_number) <= 1) {
+    return;
+  }
+  const getPrevious = new XMLHttpRequest();
+
+  getPrevious.onreadystatechange = function (){
+    if (this.readyState == 4 && this.status == 200) {
+      if (this.responseText === 'no-previous-sample') {
+        return;
+      }
+      const resp = JSON.parse(this.responseText);
+
+      if (resp['sample_folder'] === 'done'){
+        setSampleNumber("No more samples!");
+        return;
+      }
+      setImages(resp['sample_folder'])
+      setSampleNumber(resp['sample_number']);
+    }
+  }
+  console.log('here, previous')
+  const req_body = {
+    coder: coder,
+    sample_folder: sample_folder,
+    sample_number: sample_number,
+  };
+
+  console.log(JSON.stringify(req_body))
+
+  getPrevious.open('POST', 'https://cgt-coder-app.herokuapp.com/previous');
+  getPrevious.setRequestHeader('Content-Type', 'application/json');
+  getPrevious.send(JSON.stringify(req_body));
+}
+
+
 function loadInitialPictures(){
     const folder_request = new XMLHttpRequest();
 
@@ -97,8 +136,12 @@ function loadInitialPictures(){
 
     //add event listeners to form
     const form = document.getElementById('coder-input');
+
+    const button = document.getElementById('back-button');
     
     form.addEventListener('submit', handleFormSubmit);
+
+    button.addEventListener('click', handlePreviousButtonClick);
 }
 
 document.addEventListener("DOMContentLoaded", loadInitialPictures);
