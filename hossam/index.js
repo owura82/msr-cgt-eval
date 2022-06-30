@@ -17,6 +17,7 @@ function setImages(sample_folder){
     document.getElementById('tr-image').src = '../assets/img/evals/'+sample_folder+'/coders/A.png';
   }
   document.getElementById('sample-folder').textContent = sample_folder;
+  document.getElementById('coder-input').reset();
 }
 
 function getSelection(response){
