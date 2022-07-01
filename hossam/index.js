@@ -93,10 +93,11 @@ function handlePreviousButtonClick() {
       }
       const resp = JSON.parse(this.responseText);
 
-      if (resp['sample_folder'] === 'done'){
-        setSampleNumber("No more samples!");
-        return;
-      }
+      // if (resp['sample_folder'] === 'done'){
+      //   setSampleNumber("No more samples!");
+      //   return;
+      // }
+
       setImages(resp['sample_folder'])
       setSampleNumber(resp['sample_number']);
     }
