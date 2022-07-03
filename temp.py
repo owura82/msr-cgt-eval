@@ -1,6 +1,7 @@
 import enum
 from getopt import gnu_getopt
 import os
+import random
 
 #Code to create response files with prompts
 # count = 0
@@ -77,7 +78,13 @@ with open('initialize_result_table.csv', 'w') as f:
     for i,link in enumerate(links):
         folder = folder_name_from_link(link)
         pos = str(i+1)
-        to_write = pos+','+folder+',C'
+        to_write = pos+','+folder+',X'
+        num = random.randint(1,2)
+        if num == 1:
+            to_write += ',I'
+        else:
+            to_write += ',N'
+            
         if i < 86:
             to_write += '\n'
         f.write(to_write)

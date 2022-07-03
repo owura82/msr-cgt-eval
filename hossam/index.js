@@ -5,11 +5,12 @@ function setSampleNumber(sample_number){
   document.getElementById('sample-number').textContent = sample_number;
 }
 
-function setImages(sample_folder){
-  const rand = Math.floor(Math.random() * 10);
+function setImages(sample_folder, order){
+  // const rand = Math.floor(Math.random() * 10);
 
   document.getElementById('bottom-image').src = '../assets/img/evals/'+sample_folder+'/coders/C.png'
-  if (rand % 2){
+  if (order === 'N'){
+    //N = normal, I= inverted (doesnt really matter)
     document.getElementById('tl-image').src = '../assets/img/evals/'+sample_folder+'/coders/A.png';
     document.getElementById('tr-image').src = '../assets/img/evals/'+sample_folder+'/coders/B.png';
   } else {
@@ -18,6 +19,8 @@ function setImages(sample_folder){
   }
   document.getElementById('sample-folder').textContent = sample_folder;
   document.getElementById('coder-input').reset();
+
+  console.log(document.getElementById('top-left').offsetHeight)
 }
 
 function getSelection(response){
@@ -51,15 +54,13 @@ function handleFormSubmit(e){
 
         const resp = JSON.parse(this.responseText);
 
-        if (resp['sample_folder'] === 'done'){
-          setSampleNumber("No more samples!");
-          return;
+        if (resp['all_done'] === 'yes'){
+          showAllDoneMessage();
         }
-        setImages(resp['sample_folder'])
+        setImages(resp['sample_folder'], resp['top_order'])
         setSampleNumber(resp['sample_number']);
       }
     }
-    console.log('here')
     const req_body = {
       coder: coder,
       sample_folder: sample_folder,
@@ -97,8 +98,11 @@ function handlePreviousButtonClick() {
       //   setSampleNumber("No more samples!");
       //   return;
       // }
+      if (resp['all_done'] === 'yes'){
+        showAllDoneMessage();
+      }
 
-      setImages(resp['sample_folder'])
+      setImages(resp['sample_folder'], resp['top_order'])
       setSampleNumber(resp['sample_number']);
     }
   }
@@ -116,6 +120,43 @@ function handlePreviousButtonClick() {
   getPrevious.send(JSON.stringify(req_body));
 }
 
+function handleGetSample(){
+  const entered_value = document.getElementById('to-retrieve').value;
+
+  if (isNaN(entered_value) || entered_value===''){
+    alert("Must enter a number");
+    return
+  }
+
+  if ((parseInt(entered_value) < 1 || parseInt(entered_value) > 87)){
+    alert("Number must be between 1 and 87 (inclusive)");
+    return
+  }
+
+  //make request for sample and update page
+  const sample_request = new XMLHttpRequest();
+
+  sample_request.onreadystatechange = function (){
+    if (this.readyState == 4 && this.status == 200) {
+
+      const resp = JSON.parse(this.responseText);
+
+      if (resp['all_done'] === 'yes'){
+        showAllDoneMessage();
+      }
+      setImages(resp['sample_folder'], resp['top_order'])
+      setSampleNumber(resp['sample_number']);
+    }
+  }
+  sample_request.open('GET', 'https://cgt-coder-app.herokuapp.com/get-sample?num='+entered_value+'&coder='+coder);
+  sample_request.send();
+
+}
+
+function showAllDoneMessage(){
+  document.getElementById('all-done-container').style.display = 'initial';
+}
+
 
 function loadInitialPictures(){
     const folder_request = new XMLHttpRequest();
@@ -125,11 +166,10 @@ function loadInitialPictures(){
 
         const resp = JSON.parse(this.responseText);
 
-        if (resp['sample_folder'] === 'done'){
-          setSampleNumber("No more samples!");
-          return;
+        if (resp['all_done'] === 'yes'){
+          showAllDoneMessage();
         }
-        setImages(resp['sample_folder'])
+        setImages(resp['sample_folder'], resp['top_order'])
         setSampleNumber(resp['sample_number']);
       }
     }
@@ -139,11 +179,15 @@ function loadInitialPictures(){
     //add event listeners to form
     const form = document.getElementById('coder-input');
 
-    const button = document.getElementById('back-button');
+    const back_button = document.getElementById('back-button');
+
+    const retrieve_button = document.getElementById('get-sample-button');
     
     form.addEventListener('submit', handleFormSubmit);
 
-    button.addEventListener('click', handlePreviousButtonClick);
+    back_button.addEventListener('click', handlePreviousButtonClick);
+
+    retrieve_button.addEventListener('click', handleGetSample);
 }
 
 document.addEventListener("DOMContentLoaded", loadInitialPictures);

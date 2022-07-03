@@ -16,30 +16,30 @@
       } */
 
       #top-left {
-        border-style: solid;
-        border-color: aqua;
+        /* border-style: solid; */
+        /* border-color: aqua; */
         height: fit-content;
         width: fit-content;
         position: absolute;
-        top: 5vh;
+        top: 6vh;
         left: 5vw;
       }
       #top-right {
-        border-style: solid;
-        border-color: blueviolet;
+        /* border-style: solid;
+        border-color: blueviolet; */
         height: fit-content;
         width: fit-content;
         position: absolute;
-        top: 5vh;
+        top: 6vh;
         right: 5vw;
       }
       #bottom {
-        border-style: solid;
+        /* border-style: solid; */
         height: fit-content;
         width: fit-content;
         margin: auto;
         position: absolute;
-        top: 50vh;
+        top: 49vh;
         left: 0;
         right: 0;
       }
@@ -56,23 +56,30 @@
 
       #bottom-image {
         max-width: 80vw;
-        max-height: 40vh;
+        max-height: 45vh;
       }
 
       #form-container {
         position: absolute;
-        top: 92vh;
+        top: 96vh;
         left: 35vw;
       }
 
-      #sample-num-container {
+      #header-container {
         text-align: center;
         font-weight: bold;
-        font-size: 2vh;
+        font-size: 3vh;
       }
 
       .hidden {
         visibility: hidden;
+      }
+
+      #all-done-container{
+        display: none;
+        font-weight: bold;
+        font-size: 4vh;
+        color: #7141e0;
       }
 
     </style>
@@ -80,8 +87,10 @@
   <body>
 	<script src="index.js"></script>
 
-  <div id="sample-num-container">
-      
+  <div id="header-container">
+      <span id="sample-num-container"></span>
+      <span id="all-done-container"> - Responses for ALL Samples have been Collected. Thank You!</span>
+      <br>
   </div>
   
   <div id="pic-container">
@@ -140,6 +149,11 @@
 
       <input type="submit" id="submit-button" value="Submit Selection">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+
+      <label for="get-sample">Search for Sample (1 - 87):</label>
+      <input type="text" name="get-sample" id="to-retrieve">
+      <input type="button" id="get-sample-button" value="Retrieve">
+      
     </form>
 
   </div>
