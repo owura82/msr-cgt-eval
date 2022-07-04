@@ -19,8 +19,6 @@ function setImages(sample_folder, order){
   }
   document.getElementById('sample-folder').textContent = sample_folder;
   document.getElementById('coder-input').reset();
-
-  console.log(document.getElementById('top-left').offsetHeight)
 }
 
 function getSelection(response){
@@ -57,6 +55,7 @@ function handleFormSubmit(e){
         if (resp['all_done'] === 'yes'){
           showAllDoneMessage();
         }
+        console.log('response folder --> ', resp['sample_folder']);
         setImages(resp['sample_folder'], resp['top_order'])
         setSampleNumber(resp['sample_number']);
       }

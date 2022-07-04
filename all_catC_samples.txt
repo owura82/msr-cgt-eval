@@ -51,7 +51,7 @@ https://github.com/dbry/WavPack/commit/36a24c7881427d2e1e4dc1cef58f19eee0d13aec
 https://github.com/kohler/gifsicle/commit/118a46090c50829dc543179019e6140e1235f909
 https://github.com/torvalds/linux/commit/7d11f77f84b27cef452cee332f4e469503084737
 https://github.com/torvalds/linux/commit/c095508770aebf1b9218e77026e48345d719b17c
-https://github.com/embedthis/goahead/commit/5e6be61e42448f503e75e287dc332b1ecbf2a665#diff-7c9c60c790648b06210f57b9e2f53ca7
+https://github.com/embedthis/goahead/commit/5e6be61e42448f503e75e287dc332b1ecbf2a665
 https://github.com/torvalds/linux/commit/71bb99a02b32b4cc4265118e85f6035ca72923f0
 https://github.com/FFmpeg/FFmpeg/commit/58cf31cee7a456057f337b3102a03206d833d5e8
 https://github.com/torvalds/linux/commit/299d7572e46f98534033a9e65973f13ad1ce9047
