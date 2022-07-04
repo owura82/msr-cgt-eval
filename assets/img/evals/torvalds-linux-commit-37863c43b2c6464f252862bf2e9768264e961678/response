@@ -767,5 +767,5 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
 
 	key = key_ref_to_ptr(key_ref);
 
-	//response - yes, just a comment
+	//response
 	/* check permissions */

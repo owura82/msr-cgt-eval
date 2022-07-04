@@ -430,7 +430,7 @@ AcpiNsEvaluate (
         Status = AE_OK;
     }
 
-    //response - just a commment
+    //response
     /*
      * For predefined names, check the return value against the ACPI
      * specification. Some incorrect return value types are repaired.
