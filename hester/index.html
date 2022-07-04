@@ -16,58 +16,82 @@
       } */
 
       #top-left {
-        border-style: solid;
-        border-color: aqua;
+        /* border-style: solid; */
+        /* border-color: aqua; */
         height: fit-content;
         width: fit-content;
         position: absolute;
-        top: 5vh;
-        left: 5vw;
+        top: 6vh;
+        left: 1vw;
       }
       #top-right {
-        border-style: solid;
-        border-color: blueviolet;
+        /* border-style: solid;
+        border-color: blueviolet; */
         height: fit-content;
         width: fit-content;
         position: absolute;
-        top: 5vh;
-        right: 5vw;
+        top: 6vh;
+        right: 1vw;
       }
       #bottom {
-        border-style: solid;
+        /* border-style: solid; */
         height: fit-content;
         width: fit-content;
         margin: auto;
         position: absolute;
-        top: 50vh;
+        top: 49vh;
         left: 0;
         right: 0;
       }
 
       #tl-image {
-        max-width: 43vw;
+        max-width: 48vw;
         max-height: 40vh;
       }
 
       #tr-image {
-        max-width: 43vw;
+        max-width: 48vw;
         max-height: 40vh;
       }
 
       #bottom-image {
-        max-height: 40vh;
+        max-width: 80vw;
+        max-height: 45vh;
       }
 
       #form-container {
         position: absolute;
-        top: 92vh;
+        top: 96vh;
         left: 35vw;
+      }
+
+      #header-container {
+        text-align: center;
+        font-weight: bold;
+        font-size: 3vh;
+      }
+
+      .hidden {
+        visibility: hidden;
+      }
+
+      #all-done-container{
+        display: none;
+        font-weight: bold;
+        font-size: 4vh;
+        color: #7141e0;
       }
 
     </style>
   </head>
   <body>
 	<script src="index.js"></script>
+
+  <div id="header-container">
+      <span id="sample-num-container"></span>
+      <span id="all-done-container"> - Responses for ALL Samples have been Collected. Thank You!</span>
+      <br>
+  </div>
   
   <div id="pic-container">
 
@@ -80,15 +104,15 @@
       </div> -->
 
       <!-- <div id="top-left">
-        <img id="tl-image" src="assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+        <img id="tl-image" src="../assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
       </div>
 
       <div id="top-right">
-        <img id="tr-image" src="assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+        <img id="tr-image" src="../assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
       </div>
 
     <div id="bottom">
-      <img id="bottom-image" src="assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
+      <img id="bottom-image" src="../assets/img/evals/OpenSC-OpenSC-commit-a3fc7693f3a035a8a7921cffb98432944bb42740/coders/test.png">
     </div> -->
 
     <div id="top-left">
@@ -107,27 +131,35 @@
 
   <div id="form-container">
 
-    <form action="">
+    <form id="coder-input">
       <input type="button" name="back" id="back-button" value="Go to Previous Sample">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
       <label for="response">Top Left</label>
-      <input type="radio" id="fname" name="response">
+      <input type="radio" value="tl-button" name="response">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
       <label for="response">Top Right</label>
-      <input type="radio" id="lname" name="response">
+      <input type="radio" value="tr-button" name="response">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
       
       <label for="response">Neither</label>
-      <input type="radio" id="neither" name="response">
+      <input type="radio" value="neither-button" name="response">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
-      <input type="submit" value="Submit Selection">
+      <input type="submit" id="submit-button" value="Submit Selection">
       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+
+      <label for="get-sample">Search for Sample (1 - 87):</label>
+      <input type="text" name="get-sample" id="to-retrieve">
+      <input type="button" id="get-sample-button" value="Retrieve">
+      
     </form>
 
   </div>
+
+  <div id="sample-number" class="hidden"></div>
+  <div id="sample-folder" class="hidden"></div>
 
   </body>
 </html>
