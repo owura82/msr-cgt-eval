@@ -79,7 +79,6 @@ function handleFormSubmit(e){
 
 function handlePreviousButtonClick() {
   const sample_number = document.getElementById('sample-number').textContent;
-  const sample_folder = document.getElementById('sample-folder').textContent;
 
   if (parseInt(sample_number) <= 1) {
     return;
@@ -93,10 +92,6 @@ function handlePreviousButtonClick() {
       }
       const resp = JSON.parse(this.responseText);
 
-      // if (resp['sample_folder'] === 'done'){
-      //   setSampleNumber("No more samples!");
-      //   return;
-      // }
       if (resp['all_done'] === 'yes'){
         showAllDoneMessage();
       }
@@ -108,8 +103,7 @@ function handlePreviousButtonClick() {
   console.log('here, previous')
   const req_body = {
     coder: coder,
-    sample_folder: sample_folder,
-    sample_number: sample_number,
+    sample_number: sample_number
   };
 
   console.log(JSON.stringify(req_body))
@@ -119,7 +113,48 @@ function handlePreviousButtonClick() {
   getPrevious.send(JSON.stringify(req_body));
 }
 
-function handleGetSample(){
+
+function handleGetNextButtonClick() {
+
+  const sample_number = document.getElementById('sample-number').textContent;
+
+  if (parseInt(sample_number) < 1) {
+    return;
+  }
+
+  const getNext = new XMLHttpRequest();
+
+  getNext.onreadystatechange = function (){
+    if (this.readyState == 4 && this.status == 200) {
+      if (this.responseText === 'no-previous-sample') {
+        return;
+      }
+      const resp = JSON.parse(this.responseText);
+
+      if (resp['all_done'] === 'yes'){
+        showAllDoneMessage();
+      }
+
+      setImages(resp['sample_folder'], resp['top_order'])
+      setSampleNumber(resp['sample_number']);
+    }
+  }
+  console.log('here, previous')
+  const req_body = {
+    coder: coder,
+    sample_number: sample_number
+  };
+
+  console.log(JSON.stringify(req_body))
+
+  getNext.open('POST', 'https://cgt-coder-app.herokuapp.com/next');
+  getNext.setRequestHeader('Content-Type', 'application/json');
+  getNext.send(JSON.stringify(req_body));
+
+
+}
+
+function handleGetSample(e){
   const entered_value = document.getElementById('to-retrieve').value;
 
   if (isNaN(entered_value) || entered_value===''){
@@ -149,11 +184,12 @@ function handleGetSample(){
   }
   sample_request.open('GET', 'https://cgt-coder-app.herokuapp.com/get-sample?num='+entered_value+'&coder='+coder);
   sample_request.send();
-
+  e.preventDefault();
 }
 
 function showAllDoneMessage(){
   document.getElementById('all-done-container').style.display = 'initial';
+  document.getElementById('next-button').style.display = 'initial';
 }
 
 
@@ -180,13 +216,18 @@ function loadInitialPictures(){
 
     const back_button = document.getElementById('back-button');
 
-    const retrieve_button = document.getElementById('get-sample-button');
+    const retrieve_form = document.getElementById('get-sample-form');
+
+    const next_button = document.getElementById('next-button');
     
     form.addEventListener('submit', handleFormSubmit);
 
     back_button.addEventListener('click', handlePreviousButtonClick);
 
-    retrieve_button.addEventListener('click', handleGetSample);
+    retrieve_form.addEventListener('submit', handleGetSample);
+
+    next_button.addEventListener('click', handleGetNextButtonClick);
+    
 }
 
 document.addEventListener("DOMContentLoaded", loadInitialPictures);

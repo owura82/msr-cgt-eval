@@ -39,7 +39,7 @@
         width: fit-content;
         margin: auto;
         position: absolute;
-        top: 49vh;
+        top: 47vh;
         left: 0;
         right: 0;
       }
@@ -60,9 +60,14 @@
       }
 
       #form-container {
+        /* border-style: dashed; */
+        width: fit-content;
         position: absolute;
-        top: 96vh;
-        left: 35vw;
+        margin: auto;
+        top: 92.5vh;
+        /* left: 35vw; */
+        left: 0;
+        right: 0;
       }
 
       #header-container {
@@ -79,7 +84,12 @@
         display: none;
         font-weight: bold;
         font-size: 4vh;
-        color: #7141e0;
+        color: #f019ac;
+      }
+
+      #next-button {
+        display: none;
+        color: blue;
       }
 
     </style>
@@ -131,30 +141,40 @@
 
   <div id="form-container">
 
-    <form id="coder-input">
-      <input type="button" name="back" id="back-button" value="Go to Previous Sample">
-      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+      <form id="coder-input">
+        <input type="button" name="back" id="back-button" value="Go to Previous Sample">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  
+        <label for="response">Top Left</label>
+        <input type="radio" value="tl-button" name="response">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  
+        <label for="response">Top Right</label>
+        <input type="radio" value="tr-button" name="response">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        
+        <label for="response">Neither</label>
+        <input type="radio" value="neither-button" name="response">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  
+        <input type="submit" id="submit-button" value="Submit Selection">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  
+        <!-- <label for="get-sample">Search for Sample (1 - 87):</label>
+        <input type="text" name="get-sample" id="to-retrieve">
+        <input type="button" id="get-sample-button" value="Retrieve"> -->
+        
+      </form>
+      <br>
+      <form id="get-sample-form">
+        <label for="get-sample">Search for Sample (1 - 87):</label>
+        <input type="text" name="get-sample" id="to-retrieve">
+        <input type="submit" id="get-sample-button" value="Retrieve">
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
-      <label for="response">Top Left</label>
-      <input type="radio" value="tl-button" name="response">
-      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <input type="button" name="next" id="next-button" value="Go to Next Sample">
 
-      <label for="response">Top Right</label>
-      <input type="radio" value="tr-button" name="response">
-      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-      
-      <label for="response">Neither</label>
-      <input type="radio" value="neither-button" name="response">
-      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-
-      <input type="submit" id="submit-button" value="Submit Selection">
-      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-
-      <label for="get-sample">Search for Sample (1 - 87):</label>
-      <input type="text" name="get-sample" id="to-retrieve">
-      <input type="button" id="get-sample-button" value="Retrieve">
-      
-    </form>
+      </form>
 
   </div>
 
